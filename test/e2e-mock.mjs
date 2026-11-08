@@ -125,6 +125,9 @@ try {
       }
     }
     assert.equal(new Set(gen.jobs.map((j) => j.chat_id)).size, 12, "each job gets its own chat");
+    const t0 = gen.jobs.find((j) => j.status === "done").timing;
+    assert.ok(t0 && t0.chatgpt_generating > 0 && t0.download >= 0, "timing breakdown present: " + JSON.stringify(t0));
+    console.log(`   timing of one job: ${JSON.stringify(t0)}`);
     assert.ok(stats.maxConcurrent >= 8, `expected parallel generation, max concurrent was ${stats.maxConcurrent}`);
     assert.equal(stats.uploads, 1);
     assert.ok(secs < 60, `12 jobs took ${secs}s — not parallel?`);
@@ -162,10 +165,16 @@ try {
     assert.match(p.jobs[3].images[0].path, /-t3\.png$/, "second edit on same chat is turn 3");
   });
 
-  await step("get_chat_images downloads the whole history of a chat", async () => {
+  await step("get_chat_images: whole history of a chat, and 7 chats in ONE call without page loads", async () => {
     const chat = gen.jobs.find((j) => j.label === "cabin-1").chat_id;
-    const r = parse(await client.callTool({ name: "get_chat_images", arguments: { chat_id: chat } }));
-    assert.equal(r.images.length, 3); // original + 2 edits
+    const one = parse(await client.callTool({ name: "get_chat_images", arguments: { chat_id: chat, return_images: false } }));
+    assert.equal(one.chats[0].images.length, 3); // original + 2 edits
+    const ids = gen.jobs.filter((j) => j.status === "done").slice(0, 7).map((j) => j.chat_id);
+    const t = Date.now();
+    const many = parse(await client.callTool({ name: "get_chat_images", arguments: { chat_ids: ids, return_images: false } }));
+    assert.equal(many.chats.length, 7);
+    assert.ok(many.chats.every((c) => !c.error && !c.not_fetched && c.images.length >= 1), JSON.stringify(many));
+    console.log(`   7 chats fetched in ${((Date.now() - t) / 1000).toFixed(1)}s`);
   });
 
   await step("list_chats", async () => {

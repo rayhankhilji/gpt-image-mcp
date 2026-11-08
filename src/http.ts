@@ -169,7 +169,7 @@ async function handleRest(
     }
     const m = url.pathname.match(/^\/api\/chats\/([\w-]+)\/images$/);
     if (req.method === "POST" && m) {
-      const r = await manager.fetchChatImages(m[1]);
+      const r = await manager.fetchChatImages(m[1]); // single chat; MCP get_chat_images handles batches
       return send(200, { ...r, images: r.images.map((i) => ({ ...i, url: fileUrl(i.path) })) });
     }
     send(404, { error: "unknown endpoint" });

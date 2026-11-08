@@ -12,4 +12,6 @@ if [ ! -f dist/cli.js ] || [ -n "$(find src -newer dist/cli.js -print -quit)" ];
 fi
 # Save images inside the project so they're easy to open, unless told otherwise.
 export GPT_IMAGE_OUTPUT_DIR="${GPT_IMAGE_OUTPUT_DIR:-$PWD/generated-images}"
+# Failure screenshots next to the images, where an agent will look for them.
+export GPT_IMAGE_DEBUG_DIR="${GPT_IMAGE_DEBUG_DIR:-$GPT_IMAGE_OUTPUT_DIR/_debug}"
 exec node dist/cli.js "$@"

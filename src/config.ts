@@ -24,7 +24,7 @@ export const config = {
   /** Where images are saved unless a tool call passes output_dir. */
   outputDir: env.GPT_IMAGE_OUTPUT_DIR || path.join(home, "images"),
   statePath: path.join(home, "state.json"),
-  debugDir: path.join(home, "debug"),
+  debugDir: env.GPT_IMAGE_DEBUG_DIR || path.join(home, "debug"),
 
   /** Overridable for testing against a mock. */
   baseUrl: (env.GPT_IMAGE_BASE_URL || "https://chatgpt.com").replace(/\/+$/, ""),

@@ -213,20 +213,35 @@ export function createServer(manager: JobManager, opts: ServerOptions = {}): Mcp
   server.registerTool(
     "get_chat_images",
     {
-      title: "Download all images from a chat",
-      description: "Download every generated image in a ChatGPT chat (full resolution) — including late finishers after a timeout, or chats made by hand in the ChatGPT UI.",
+      title: "Download all images from chats",
+      description:
+        "Download every generated image (full resolution) from one or MANY ChatGPT chats in a single call — " +
+        "late finishers after a timeout, or chats made by hand in the ChatGPT UI. Pass all chat ids at once in chat_ids " +
+        "(don't call this in parallel). Chats not reached before the call's time limit come back as not_fetched — call again with just those.",
       inputSchema: {
-        chat_id: z.string().min(1).describe("chat_id or chatgpt.com/c/<id> URL"),
+        chat_ids: z.array(z.string().min(1)).max(100).optional().describe("chat_ids or chatgpt.com/c/<id> URLs"),
+        chat_id: z.string().min(1).optional().describe("Single chat (same as chat_ids with one entry)."),
         output_dir: z.string().optional(),
-        return_images: z.boolean().default(false),
+        return_images: z.boolean().default(true),
       },
     },
     async (args) => {
-      const r = await manager.fetchChatImages(args.chat_id, args.output_dir);
-      const images = r.images.map((i) => ({ path: i.path, width: i.width, height: i.height, ...(opts.fileUrl ? { url: opts.fileUrl(i.path) } : {}) }));
-      const content: Content[] = [{ type: "text", text: JSON.stringify({ ...r, images }, null, 2) }];
-      if (args.return_images) content.push(...(await previews(r.images)));
-      return { content };
+      const ids = [...(args.chat_ids ?? []), ...(args.chat_id ? [args.chat_id] : [])];
+      if (!ids.length) return { content: [{ type: "text" as const, text: "Pass chat_ids (or chat_id)." }], isError: true };
+      const results = await manager.fetchManyChatImages(ids, args.output_dir, Date.now() + callWaitMs() - 8000);
+      const chats = results.map((r) => ({
+        ...r,
+        images: r.images.map((i) => ({ path: i.path, width: i.width, height: i.height, ...(opts.fileUrl ? { url: opts.fileUrl(i.path) } : {}) })),
+      }));
+      const notFetched = results.filter((r) => r.not_fetched).map((r) => r.chat_id);
+      const payload = { chats, ...(notFetched.length ? { hint: `Call get_chat_images again with chat_ids: ${JSON.stringify(notFetched)}` } : {}) };
+      const content: Content[] = [{ type: "text", text: JSON.stringify(payload, null, 2) }];
+      if (args.return_images) {
+        const fresh = results.flatMap((r) => r.images).filter((i) => !previewed.has(i.path));
+        fresh.forEach((i) => previewed.add(i.path));
+        content.push(...(await previews(fresh)));
+      }
+      return { content, isError: results.every((r) => r.error) };
     },
   );
 

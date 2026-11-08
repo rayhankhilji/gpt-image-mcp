@@ -67,6 +67,9 @@ export interface Job extends JobSpec {
   debugScreenshot?: string;
   createdAt: number;
   startedAt?: number;
+  sentAt?: number;
+  chatAt?: number;
+  detectedAt?: number;
   finishedAt?: number;
   done: Promise<Job>;
 }
@@ -244,45 +247,72 @@ export class JobManager {
     await this.browser.close();
   }
 
+  /** One loaded chatgpt.com page reused for read-only data calls (no page load per chat). */
+  private dataPageP: Promise<Page> | null = null;
+  private async dataPage(): Promise<Page> {
+    if (this.dataPageP) {
+      const p = await this.dataPageP.catch(() => null);
+      if (p && !p.isClosed()) return p;
+    }
+    this.dataPageP = (async () => {
+      const page = await this.browser.newIsolatedPage();
+      await openUrl(page, newChatUrl());
+      return page;
+    })();
+    return this.dataPageP;
+  }
+
   /** Download every generated image in an existing chat (including ones made by hand in the UI). */
   async fetchChatImages(chatIdOrUrl: string, outputDir?: string): Promise<{ chat_id: string; title?: string; images: SavedImage[] }> {
     const chatId = normalizeChatId(chatIdOrUrl);
-    const prev = this.chatLocks.get(chatId) ?? Promise.resolve();
-    const work = prev.catch(() => {}).then(async () => {
-      await this.sem.acquire();
-      let page: Page | undefined;
-      try {
-        page = await this.takeTab(chatId);
-        const r = await fetchConversation(page, chatId);
-        if (!r.ok || !r.json?.mapping) throw new Error(`Could not load conversation ${chatId} (HTTP ${r.status})`);
-        const pointers = new Set<string>();
-        for (const node of Object.values<any>(r.json.mapping)) {
-          const m = node?.message;
-          if (!m || m.author?.role === "user") continue;
-          for (const part of m.content?.parts ?? []) {
-            if (part?.content_type === "image_asset_pointer" && part.asset_pointer) pointers.add(part.asset_pointer);
-          }
-        }
-        const dir = this.resolveOutDir(outputDir);
-        const images: SavedImage[] = [];
-        let i = 0;
-        for (const ptr of pointers) {
-          i++;
-          const url = await resolvePointer(page, ptr, chatId);
-          const buf = await downloadUrl(page, url);
-          images.push(this.saveImage(buf, dir, `${slug(r.json.title || "chat")}-${chatId.slice(0, 8)}-all-${i}`));
-        }
-        this.state.upsertChat(chatId, { url: chatUrl(chatId), title: r.json.title });
-        this.releaseTab(chatId, page);
-        page = undefined;
-        return { chat_id: chatId, title: r.json.title as string | undefined, images };
-      } finally {
-        if (page) await page.close().catch(() => {});
-        this.sem.release();
+    const page = await this.dataPage();
+    let r = await fetchConversation(page, chatId);
+    // apiGet waits out ChatGPT's cooldown before each retry.
+    for (let i = 0; i < 5 && r.status === 429; i++) r = await fetchConversation(page, chatId);
+    if (!r.ok || !r.json?.mapping) throw new Error(`Could not load conversation ${chatId} (HTTP ${r.status})`);
+    const pointers = new Set<string>();
+    for (const node of Object.values<any>(r.json.mapping)) {
+      const m = node?.message;
+      if (!m || m.author?.role === "user") continue;
+      for (const part of m.content?.parts ?? []) {
+        if (part?.content_type === "image_asset_pointer" && part.asset_pointer) pointers.add(part.asset_pointer);
       }
-    });
-    this.chatLocks.set(chatId, work);
-    return work;
+    }
+    const dir = this.resolveOutDir(outputDir);
+    const images: SavedImage[] = [];
+    let i = 0;
+    for (const ptr of pointers) {
+      i++;
+      const url = await resolvePointer(page, ptr, chatId);
+      const buf = await downloadUrl(page, url);
+      images.push(this.saveImage(buf, dir, `${slug(r.json.title || "chat")}-${chatId.slice(0, 8)}-all-${i}`));
+    }
+    this.state.upsertChat(chatId, { url: chatUrl(chatId), title: r.json.title });
+    return { chat_id: chatId, title: r.json.title as string | undefined, images };
+  }
+
+  /**
+   * Many chats in one go, two at a time through the shared rate limiter. Stops starting new chats
+   * at the deadline so the tool call returns in time; those come back as not_fetched.
+   */
+  async fetchManyChatImages(ids: string[], outputDir: string | undefined, deadline: number) {
+    const results: Array<{ chat_id: string; title?: string; images: SavedImage[]; error?: string; not_fetched?: boolean }> = [];
+    const queue = ids.map((id, idx) => ({ id, idx }));
+    const worker = async () => {
+      for (let item = queue.shift(); item; item = queue.shift()) {
+        if (Date.now() > deadline) {
+          results[item.idx] = { chat_id: normalizeChatId(item.id), images: [], not_fetched: true };
+          continue;
+        }
+        try {
+          results[item.idx] = await this.fetchChatImages(item.id, outputDir);
+        } catch (err) {
+          results[item.idx] = { chat_id: normalizeChatId(item.id), images: [], error: (err as Error).message };
+        }
+      }
+    };
+    await Promise.all([worker(), worker()]);
+    return results;
   }
 
   // ---------------------------------------------------------------- internals
@@ -322,8 +352,10 @@ export class JobManager {
           debug(`${job.id} sent in ${Date.now() - t0}ms (at +${Date.now() - job.createdAt}ms)`);
         });
         job.status = "generating";
+        job.sentAt = Date.now();
         try {
           chatId = job.kind === "edit" ? job.chatId! : await waitForConversationId(page);
+          job.chatAt = Date.now();
           break;
         } catch (err) {
           // The send didn't create a chat (nothing was generated) — retry once in a fresh context.
@@ -338,6 +370,7 @@ export class JobManager {
       this.state.upsertChat(chatId, { url: job.chatUrl, label: job.kind === "generate" ? job.label : undefined });
 
       const outcome = await this.monitor(page, job, chatId, baseUsers, baselineDom);
+      job.detectedAt = Date.now();
 
       job.status = "downloading";
       const dir = this.resolveOutDir(job.outputDir);
@@ -583,6 +616,8 @@ export function slug(s: string): string {
   );
 }
 
+const secs = (a?: number, b?: number) => (a && b ? Math.round((b - a) / 100) / 10 : undefined);
+
 export function summarizeJob(j: Job) {
   return {
     job_id: j.id,
@@ -596,5 +631,15 @@ export function summarizeJob(j: Job) {
     error: j.error,
     debug_screenshot: j.debugScreenshot,
     elapsed_s: j.startedAt ? Math.round(((j.finishedAt ?? Date.now()) - j.startedAt) / 1000) : 0,
+    // Where the time went (seconds): our overhead vs ChatGPT's generation.
+    timing: j.finishedAt
+      ? {
+          queued: secs(j.createdAt, j.startedAt),
+          open_and_send: secs(j.startedAt, j.sentAt),
+          chat_id: secs(j.sentAt, j.chatAt),
+          chatgpt_generating: secs(j.sentAt, j.detectedAt),
+          download: secs(j.detectedAt, j.finishedAt),
+        }
+      : undefined,
   };
 }
