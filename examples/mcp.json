@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gpt-image": {
+      "command": "npx",
+      "args": ["-y", "github:rayhankhilji/gpt-image-mcp"]
+    }
+  }
+}
