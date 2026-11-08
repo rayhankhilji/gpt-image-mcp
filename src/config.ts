@@ -35,10 +35,11 @@ export const config = {
   channel: env.GPT_IMAGE_BROWSER_CHANNEL ?? "chrome",
   executablePath: env.GPT_IMAGE_EXECUTABLE_PATH || "",
   /**
-   * Default: a real (headed) Chrome window that starts minimized, so nothing is in your way.
-   * On a Linux box with no display (servers, CI, cloud agents) it runs headless automatically.
+   * undefined = auto: a real (headed) Chrome window that starts minimized. On a Linux box with no
+   * screen (servers, cloud agents) a virtual display (Xvfb) is started if available, else headless.
+   * `login` always opens a window regardless.
    */
-  headless: bool(env.GPT_IMAGE_HEADLESS, process.platform === "linux" && !env.DISPLAY && !env.WAYLAND_DISPLAY),
+  headless: env.GPT_IMAGE_HEADLESS === undefined || env.GPT_IMAGE_HEADLESS === "" ? undefined : bool(env.GPT_IMAGE_HEADLESS, false),
   window: ((env.GPT_IMAGE_WINDOW || "minimized").toLowerCase() as WindowMode),
   /** Pretend every tab is visible/focused so background tabs aren't throttled by the page. */
   forceVisible: bool(env.GPT_IMAGE_FORCE_VISIBLE, true),

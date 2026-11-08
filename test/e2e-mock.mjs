@@ -237,6 +237,16 @@ try {
     fs.rmSync(fresh, { recursive: true, force: true });
   });
 
+  await step("auto display mode + GPT_IMAGE_SESSION as a one-line cookie header (Cookie-Editor 'Header String')", async () => {
+    const fresh = fs.mkdtempSync(path.join(os.tmpdir(), "gpt-image-hdr-"));
+    const e = { ...env, GPT_IMAGE_HOME: fresh, GPT_IMAGE_SESSION: "__Secure-next-auth.session-token=mock-session; cf_clearance=abc; oai-did=xyz" };
+    delete e.GPT_IMAGE_HEADLESS; // auto: virtual display if Xvfb exists, else headless
+    delete e.DISPLAY;
+    const out = (await promisify(execFile)("node", [cli, "status"], { env: e, encoding: "utf8" })).stdout;
+    assert.equal(JSON.parse(out).loggedIn, true);
+    fs.rmSync(fresh, { recursive: true, force: true });
+  });
+
   console.log(`\nAll ${results.length} checks passed.`);
 } finally {
   mock.close();

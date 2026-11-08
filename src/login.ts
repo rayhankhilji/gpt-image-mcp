@@ -6,44 +6,16 @@
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
+import { systemBrowsers } from "./chrome-path.js";
 import { chromium } from "playwright";
 import { BrowserManager } from "./browser.js";
 import { config, log } from "./config.js";
 import { getSession, newChatUrl, type SessionInfo } from "./chatgpt.js";
 
 export function findSystemChrome(): string | null {
-  const env = process.env;
-  if (env.GPT_IMAGE_LOGIN_BROWSER) return env.GPT_IMAGE_LOGIN_BROWSER;
-  const candidates: string[] =
-    process.platform === "darwin"
-      ? [
-          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-          `${env.HOME}/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`,
-          "/Applications/Chromium.app/Contents/MacOS/Chromium",
-          "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-          "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-        ]
-      : process.platform === "win32"
-        ? [
-            `${env.PROGRAMFILES}\\Google\\Chrome\\Application\\chrome.exe`,
-            `${env["PROGRAMFILES(X86)"]}\\Google\\Chrome\\Application\\chrome.exe`,
-            `${env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe`,
-            `${env["PROGRAMFILES(X86)"]}\\Microsoft\\Edge\\Application\\msedge.exe`,
-            `${env.PROGRAMFILES}\\Microsoft\\Edge\\Application\\msedge.exe`,
-          ]
-        : [];
-  if (process.platform === "linux") {
-    for (const bin of ["google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "microsoft-edge", "brave-browser"]) {
-      try {
-        const p = execFileSync("which", [bin], { encoding: "utf8" }).trim();
-        if (p) candidates.push(p);
-      } catch {
-        /* not installed */
-      }
-    }
-  }
-  return candidates.find((p) => p && fs.existsSync(p)) ?? null;
+  if (process.env.GPT_IMAGE_LOGIN_BROWSER) return process.env.GPT_IMAGE_LOGIN_BROWSER;
+  return systemBrowsers()[0] ?? null;
 }
 
 async function freePort(): Promise<number> {

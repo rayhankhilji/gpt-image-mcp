@@ -10,8 +10,10 @@ type SameSite = "Strict" | "Lax" | "None";
 interface PwCookie {
   name: string;
   value: string;
-  domain: string;
-  path: string;
+  /** Either url (host-only, required for __Host- cookies) or domain+path. */
+  url?: string;
+  domain?: string;
+  path?: string;
   expires: number;
   httpOnly: boolean;
   secure: boolean;
@@ -32,29 +34,57 @@ export async function exportSession(ctx: BrowserContext, file: string): Promise<
 }
 
 /** Accepts Playwright storageState JSON, a Cookie-Editor / EditThisCookie export array, or a raw session-token string. */
+/**
+ * Accepts any of:
+ *  - Playwright storageState JSON (from `export-session`)
+ *  - a Cookie-Editor / EditThisCookie JSON export (array)
+ *  - a one-line cookie header string ("name=value; name2=value2", Cookie-Editor's "Header String" export)
+ *  - the raw value of the __Secure-next-auth.session-token cookie
+ */
 export function parseSessionInput(raw: string): PwCookie[] {
-  const text = raw.trim();
+  const text = raw.trim().replace(/^(['"])([\s\S]*)\1$/, "$2").trim();
+  const origin = new URL(config.baseUrl).origin + "/";
   const host = new URL(config.baseUrl).hostname;
+  // __Host- cookies must be host-only (set via url); everything else via domain+path.
+  const where = (name: string) => (name.startsWith("__Host-") ? { url: origin } : { domain: host, path: "/" });
+  const later = Math.floor(Date.now() / 1000) + 90 * 86400;
+
   if (!text.startsWith("{") && !text.startsWith("[")) {
+    if (/^[\w.\-]+=/.test(text)) {
+      // Cookie header string.
+      return text
+        .split(/;\s*/)
+        .map((pair) => {
+          const i = pair.indexOf("=");
+          return i > 0 ? { name: pair.slice(0, i).trim(), value: pair.slice(i + 1).trim() } : null;
+        })
+        .filter((c): c is { name: string; value: string } => !!c && !!c.name && !SKIP.test(c.name))
+        .map((c) => ({ ...c, ...where(c.name), expires: later, httpOnly: c.name.includes("session-token"), secure: true, sameSite: "Lax" as SameSite }));
+    }
     // Bare value of the __Secure-next-auth.session-token cookie.
-    return [mkCookie("__Secure-next-auth.session-token", text, host)];
+    return [{ name: "__Secure-next-auth.session-token", value: text, ...where("__Secure-"), expires: later, httpOnly: true, secure: true, sameSite: "Lax" }];
   }
+
   const data = JSON.parse(text);
   const list: any[] = Array.isArray(data) ? data : (data.cookies ?? []);
   return list
     .filter((c) => c && c.name && c.value !== undefined && !SKIP.test(c.name))
-    .map((c) => ({
-      name: String(c.name),
-      value: String(c.value),
-      domain: String(c.domain ?? host),
-      path: String(c.path ?? "/"),
-      expires: Number(c.expires ?? c.expirationDate ?? -1) || -1,
-      httpOnly: Boolean(c.httpOnly),
-      secure: c.secure !== false || /^__(Secure|Host)-/.test(String(c.name)) || normSameSite(c.sameSite) === "None",
-      sameSite: normSameSite(c.sameSite),
-    }))
-    // A cookie without an expiry is a "session cookie" that Chrome drops on exit — give it one so the login persists.
-    .map((c) => ({ ...c, expires: c.expires > 0 ? Math.floor(c.expires) : Math.floor(Date.now() / 1000) + 90 * 86400 }));
+    .map((c): PwCookie => {
+      const name = String(c.name);
+      const sameSite = normSameSite(c.sameSite);
+      const base = {
+        name,
+        value: String(c.value),
+        // A cookie without an expiry is a "session cookie" that Chrome drops on exit — give it one so the login persists.
+        expires: Number(c.expires ?? c.expirationDate ?? -1) > 0 ? Math.floor(Number(c.expires ?? c.expirationDate)) : later,
+        httpOnly: Boolean(c.httpOnly),
+        secure: c.secure !== false || /^__(Secure|Host)-/.test(name) || sameSite === "None",
+        sameSite,
+      };
+      // __Host- cookies must be host-only (no Domain attribute).
+      if (name.startsWith("__Host-") || !c.domain) return { ...base, ...where(name) };
+      return { ...base, domain: String(c.domain), path: String(c.path ?? "/") };
+    });
 }
 
 export async function importSession(ctx: BrowserContext, raw: string): Promise<number> {
@@ -62,10 +92,6 @@ export async function importSession(ctx: BrowserContext, raw: string): Promise<n
   if (!cookies.length) throw new Error("No cookies found in the provided session data.");
   await ctx.addCookies(cookies);
   return cookies.length;
-}
-
-function mkCookie(name: string, value: string, domain: string): PwCookie {
-  return { name, value, domain, path: "/", expires: Math.floor(Date.now() / 1000) + 90 * 86400, httpOnly: true, secure: true, sameSite: "Lax" };
 }
 
 function normSameSite(v: unknown): SameSite {

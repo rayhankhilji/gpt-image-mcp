@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "gpt-image": {
+      "command": "bash",
+      "args": ["${CLAUDE_PROJECT_DIR:-.}/scripts/mcp-launch.sh"]
+    }
+  }
+}

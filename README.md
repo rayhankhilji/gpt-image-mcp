@@ -29,6 +29,26 @@ agent ──MCP / CLI / REST──▶ gpt-image-mcp ──▶ Chrome (your ChatG
 - **Reading** uses ChatGPT's internal JSON endpoints (`/backend-api/conversation/{id}`, `/backend-api/files/download/{id}`), called from inside the logged-in page. That's how it knows when an image is finished and gets the original file. The DOM is only a fallback.
 - **Pacing:** prompt submissions are spaced out slightly (`GPT_IMAGE_SEND_GAP_MS`), and generation runs fully in parallel (`GPT_IMAGE_MAX_CONCURRENCY`, default 10).
 
+## Claude Code on the web: no terminal needed
+
+This repo is already set up for web sessions: [`.mcp.json`](.mcp.json) and [`scripts/mcp-launch.sh`](scripts/mcp-launch.sh)
+install, build and start the server automatically, and the cloud container runs Chrome on a virtual screen.
+You only need to hand it your ChatGPT login once:
+
+1. **Copy your login from your normal browser** (on a computer where you're signed in to chatgpt.com):
+   install the free **Cookie-Editor** extension (Chrome / Edge / Firefox / Safari). Open chatgpt.com, click
+   Cookie-Editor, then **Export → Header String**. That copies one line to your clipboard.
+2. **Save it in the cloud environment, not in the chat**: in Claude Code on the web, open the cloud
+   environment menu in the session's title bar, then **Edit**, and add an environment variable:
+   `GPT_IMAGE_SESSION=<paste>`. Save.
+3. **Start a new session** on this repo and ask, e.g.: *"Use gpt-image to make 6 logo concepts for a coffee
+   brand called Ember, then make #3 warmer."* Images land in `generated-images/`.
+
+That line is your ChatGPT login, so keep the environment private. When ChatGPT eventually logs it out, repeat
+step 1 and update the variable. To use it from **other** repos' sessions, add the same `.mcp.json` entry
+there with `"command": "npx", "args": ["-y", "github:rayhankhilji/gpt-image-mcp"]`. That works if this repo
+is public or published to npm.
+
 ## Quick start (your own computer)
 
 Requires Node 18+ and Google Chrome. If you don't have Chrome, run `npx playwright install chromium` and set `GPT_IMAGE_BROWSER_CHANNEL=chromium`.
@@ -152,7 +172,7 @@ human", run it on a home or residential network.
 
 ### Other login options
 
-- `import-session` also accepts a **Cookie-Editor** (browser extension) JSON export from chatgpt.com, or the raw value of the `__Secure-next-auth.session-token` cookie.
+- `import-session` and `GPT_IMAGE_SESSION` also accept a **Cookie-Editor** export (JSON or one-line "Header String") from chatgpt.com, or the raw value of the `__Secure-next-auth.session-token` cookie.
 - `GPT_IMAGE_CDP_URL=http://127.0.0.1:9222` uses your own running Chrome (started with `--remote-debugging-port=9222 --user-data-dir=…`) instead of launching one.
 
 ## No MCP? CLI & REST
@@ -195,7 +215,7 @@ To refine an image: gpt-image-mcp edit <chat_id> "<change>" --out ./images
 | `GPT_IMAGE_SEND_GAP_MS` | `1200` | minimum gap between prompt submissions |
 | `GPT_IMAGE_TIMEOUT` | `600` | per-job timeout (seconds) |
 | `GPT_IMAGE_MAX_IDLE_TABS` | `4` | finished chats kept open for instant edits |
-| `GPT_IMAGE_HEADLESS` | auto | `1` = no window. Auto-on when there's no display |
+| `GPT_IMAGE_HEADLESS` | auto | `1` = headless. Auto: on Linux without a screen, a virtual display (Xvfb) is used if installed, else headless |
 | `GPT_IMAGE_WINDOW` | `minimized` | `minimized` / `normal` / `offscreen` (headed mode) |
 | `GPT_IMAGE_BROWSER_CHANNEL` | `chrome` | `chrome`, `msedge`, or `chromium` (Playwright's) |
 | `GPT_IMAGE_EXECUTABLE_PATH` | | explicit browser binary |

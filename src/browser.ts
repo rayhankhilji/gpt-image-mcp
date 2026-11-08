@@ -2,6 +2,8 @@ import fs from "node:fs";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { config, log, debug } from "./config.js";
 import { seedFromEnv } from "./session.js";
+import { preinstalledChromium, systemBrowsers } from "./chrome-path.js";
+import { ensureVirtualDisplay, stopVirtualDisplay } from "./display.js";
 
 const LAUNCH_ARGS = [
   // Keep background tabs running at full speed so 10-20 chats can generate in parallel.
@@ -28,6 +30,7 @@ export class BrowserManager {
   private browser: Browser | null = null;
   private starting: Promise<BrowserContext> | null = null;
   private ownedPages = new Set<Page>();
+  private headless = false;
 
   constructor(private opts: { forceHeaded?: boolean } = {}) {}
 
@@ -53,7 +56,11 @@ export class BrowserManager {
       ctx = this.browser.contexts()[0] ?? (await this.browser.newContext());
     } else {
       fs.mkdirSync(config.profileDir, { recursive: true });
-      const headless = this.opts.forceHeaded ? false : config.headless;
+      let headless: boolean;
+      if (this.opts.forceHeaded) headless = false;
+      else if (config.headless !== undefined) headless = config.headless;
+      else headless = !(await ensureVirtualDisplay());
+      this.headless = headless;
       const args = [...LAUNCH_ARGS];
       if (!headless && config.window === "offscreen") args.push("--window-position=-32000,-32000");
       const base = {
@@ -65,8 +72,12 @@ export class BrowserManager {
 
       const attempts: Array<Record<string, unknown>> = [];
       if (config.executablePath) attempts.push({ executablePath: config.executablePath });
-      else if (config.channel && config.channel !== "chromium") attempts.push({ channel: config.channel }, {});
-      else attempts.push({});
+      else {
+        if (config.channel && config.channel !== "chromium") attempts.push({ channel: config.channel });
+        attempts.push({}); // Playwright's own Chromium, if installed
+        // Then any Chrome/Chromium already on the machine (incl. cloud images with a pre-installed Chromium).
+        for (const p of [...systemBrowsers(), ...preinstalledChromium()]) attempts.push({ executablePath: p });
+      }
 
       let lastErr: unknown;
       ctx = undefined as unknown as BrowserContext;
@@ -84,7 +95,7 @@ export class BrowserManager {
                 `Close it, or point this instance at a different profile with GPT_IMAGE_PROFILE_DIR.`,
             );
           }
-          if (extra.channel) log(`could not launch channel "${String(extra.channel)}" (${msg.split("\n")[0]}); falling back to bundled Chromium`);
+          debug(`launch attempt ${JSON.stringify(extra)} failed: ${msg.split("\n")[0]}`);
         }
       }
       if (!ctx) {
@@ -110,7 +121,7 @@ export class BrowserManager {
       }
     }
 
-    if (!config.cdpUrl && !config.headless && config.window === "minimized") {
+    if (!config.cdpUrl && !this.headless && !this.opts.forceHeaded && config.window === "minimized") {
       const p = ctx.pages()[0] ?? (await ctx.newPage());
       await minimizeWindow(p).catch((e) => debug("minimize failed", e));
     }
@@ -125,7 +136,7 @@ export class BrowserManager {
     this.ownedPages.add(page);
     page.on("close", () => this.ownedPages.delete(page));
     if (config.forceVisible) await page.addInitScript(FORCE_VISIBLE_SCRIPT);
-    if (!config.cdpUrl && !this.opts.forceHeaded && !config.headless && config.window === "minimized") {
+    if (!config.cdpUrl && !this.opts.forceHeaded && !this.headless && config.window === "minimized") {
       await minimizeWindow(page).catch((e) => debug("minimize failed", e));
     }
     page.setDefaultTimeout(30_000);
@@ -178,6 +189,7 @@ export class BrowserManager {
         await this.browser?.close().catch(() => {});
       } else {
         await ctx.close();
+        stopVirtualDisplay();
       }
     } catch (err) {
       debug("close error", err);
