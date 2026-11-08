@@ -32,7 +32,8 @@ export const SEL = {
   ],
   fileInput: [
     "#octane-mobile-composer-files-input",
-    'input[type="file"][accept*="image"]',
+    'input[type="file"][accept*="image"]:not([capture])',
+    'input[type="file"]:not([capture])',
     'input[type="file"]',
   ],
   userMessage: ['[data-message-author-role="user"]', '[data-turn="user"]', '[data-role="user"]'],

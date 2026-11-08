@@ -1,7 +1,7 @@
 {
   "name": "gpt-image-mcp",
   "version": "0.1.0",
-  "description": "MCP server that lets AI agents generate & iterate images through your own ChatGPT account (Free/Go/Plus/Pro) — parallel chats, auto-download, edits.",
+  "description": "MCP server that lets AI agents generate & iterate images through your own ChatGPT account (Free/Go/Plus/Pro) \u2014 parallel chats, auto-download, edits.",
   "type": "module",
   "bin": {
     "gpt-image-mcp": "dist/cli.js"
@@ -9,6 +9,7 @@
   "main": "dist/server.js",
   "files": [
     "dist",
+    "data",
     "README.md",
     "LICENSE"
   ],
@@ -18,7 +19,8 @@
     "start": "node dist/cli.js serve",
     "login": "node dist/cli.js login",
     "test": "npm run build && node test/e2e-mock.mjs",
-    "prepare": "tsc -p tsconfig.json"
+    "prepare": "tsc -p tsconfig.json",
+    "build:prompts": "node scripts/build-prompt-index.mjs"
   },
   "engines": {
     "node": ">=18.17"

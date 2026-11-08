@@ -80,10 +80,13 @@ Want it fully off your computer? See [Cloud & remote](#cloud--remote-log-in-once
 
 | Tool | What it does |
 |---|---|
-| `generate_images` | `jobs: [{prompt, label?, reference_images?, aspect_ratio?, transparent_background?}]`. Each job is a **new chat**, and all of them run in parallel. Returns `{status, chat_id, images:[{path,width,height}], text}` per job. |
+| `generate_images` | `jobs: [{prompt, preset?, styles?, text?, label?, reference_images?, reference_usage?, aspect_ratio?, transparent_background?}]`. Each job is a **new chat**, and all of them run in parallel. Returns `{status, chat_id, images:[{path,width,height}], text}` per job. |
 | `edit_images` | `edits: [{chat_id, prompt, …}]`. Sends a follow-up into existing chats to refine their image. Edits to different chats run in parallel, and edits to the same chat run in order. `chat_id` can also be a `chatgpt.com/c/…` URL, including chats you made by hand. |
 | `wait_for_jobs` | Collects jobs started with `wait: false`, or ones that outlasted a call's timeout. |
-| `get_chat_images` | Downloads every image in a chat at full resolution (late finishers, hand-made chats). |
+| `get_chat_images` | Downloads every image from one or many chats (`chat_ids`) at full resolution, in one call (late finishers, hand-made chats). |
+| `list_presets` | Presets, style modifiers and prompting rules. |
+| `search_prompts` | Proven example prompts with sample images, about 17,000 of them. |
+| `generate_brand_kit` | A consistent brand identity: logo sheet first, then assets built from it. |
 | `list_chats` | Lists chats created so far, with each turn's prompt and saved files. Survives restarts. |
 | `chatgpt_status` | Shows whether you're logged in, which plan, and the queue stats. |
 
@@ -105,6 +108,27 @@ Example: what an agent sends
 ```
 
 …then `edit_images` with `{"edits":[{"chat_id":"<from icon-b>","prompt":"warmer colors, thicker outline"}]}`.
+
+## Better prompts: presets, proven examples, references
+
+- **58 presets** (`list_presets`) cover these use cases:
+  - brand identity and assets, logos (wordmark, symbol, monogram, badge)
+  - mascots and character sheets, stickers
+  - realistic and phone photos, portraits (studio, environmental, headshot)
+  - fashion (editorial, on-model e-commerce, lookbook)
+  - products (packshot, cut-out, hero, lifestyle, flat lay)
+  - interiors (render, floor plan, isometric, moodboard), architecture, gardens
+  - cars, aircraft, landscapes, macro, food
+  - backgrounds (blur, gradient, texture, wallpaper)
+  - video start frames and storyboards
+  - UI (web, app), posters, infographics, slides, thumbnails, icon sets, illustration and game assets
+
+  Each preset follows [OpenAI's GPT Image prompting guide](https://developers.openai.com/cookbook/examples/multimodal/image-gen-models-prompting-guide.md): intended use → scene → subject → key details → constraints, plus what to avoid. **40 style modifiers** (film stock, lighting, design movements, 3D/illustration media) combine with any preset.
+- **`search_prompts`** searches about 17,000 real-world prompts with sample images. It covers ~900 bundled offline (EvoLink, CC0; ZeroLu, MIT) and ~16,000 from YouMind (MIT), which are downloaded once and cached. See [`data/THIRD_PARTY_NOTICES.md`](data/THIRD_PARTY_NOTICES.md).
+- **Reference images:** `reference_images` accepts local paths, URLs or `data:` URIs. An image the user attaches in Claude Code chat is a local file, so the agent passes its path. `reference_usage` says how to use it: `style`, `subject`, `composition`, `logo`, `character`, `product`, `brand` or `edit`.
+- **`generate_brand_kit`** makes a logo-system sheet first, then generates every asset from it, so they all share one logo, palette and type. You can request several creative directions in parallel.
+- **`text`** is exact copy, rendered once and verbatim.
+- A Claude Code skill ([`.claude/skills/gpt-image/SKILL.md`](.claude/skills/gpt-image/SKILL.md)) teaches the agent this workflow.
 
 ## Connect your agent
 

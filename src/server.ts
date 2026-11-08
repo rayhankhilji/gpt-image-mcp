@@ -3,7 +3,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { config, log } from "./config.js";
 import { getSession, newChatUrl } from "./chatgpt.js";
-import { JobManager, summarizeJob, type Job, type JobSpec } from "./jobs.js";
+import { JobManager, slug, summarizeJob, type Job, type JobSpec } from "./jobs.js";
+import { PRESETS, PROMPTING_RULES, REFERENCE_USES, STYLES } from "./presets.js";
+import { searchPrompts } from "./prompt-search.js";
+
+const DEFAULT_KIT = ["brand-app-icon", "brand-stationery", "brand-social-post", "ui-web", "brand-packaging", "brand-signage"];
 import type { SavedImage } from "./state.js";
 
 export const VERSION = "0.1.0";
@@ -18,18 +22,40 @@ interface ServerOptions {
 }
 
 const jobShape = {
-  prompt: z.string().min(1).describe("What to draw. Be specific: subject, composition, style, lighting, text to render, etc."),
+  prompt: z
+    .string()
+    .min(1)
+    .describe(
+      "The brief. With a preset: describe the subject (what list_presets says to describe). Without: write a full brief in the order " +
+        "intended use → scene → subject → key details → constraints. Be concrete (medium, materials, lens, light); one job per image.",
+    ),
   label: z.string().optional().describe("Short name used in the saved filename (e.g. 'hero-banner')."),
+  preset: z
+    .string()
+    .optional()
+    .describe("Preset id from list_presets (e.g. 'logo-mark', 'product-packshot', 'fashion-editorial', 'interior-render', 'video-start-frame'). Structures the prompt for that use case."),
+  styles: z
+    .array(z.string())
+    .optional()
+    .describe("Style modifier ids from list_presets (e.g. 'film-35mm', 'golden-hour', 'swiss-grid', 'clay-3d') or short free-text styles."),
+  text: z.string().optional().describe("Exact text to render in the image (rendered once, verbatim)."),
   reference_images: z
     .array(z.string())
     .optional()
-    .describe("Absolute paths of local images to attach (style refs, a photo to edit, a logo to include...)."),
-  aspect_ratio: z.string().optional().describe("e.g. '1:1', '3:2', '2:3', '16:9', '9:16'."),
-  transparent_background: z.boolean().optional().describe("Ask for a transparent PNG (icons, stickers, game assets)."),
-  raw: z
-    .boolean()
+    .describe(
+      "Images to attach to the ChatGPT chat: local file paths, http(s) URLs, or data:image/... URIs. If the user attached or pasted an " +
+        "image in this conversation, pass its file path here (shown as `[Image: source: /path/...]`).",
+    ),
+  reference_usage: z
+    .string()
     .optional()
-    .describe("Send the prompt verbatim. By default a short 'generate an image, no clarifying questions' wrapper is added."),
+    .describe(
+      "How to use the reference image(s): 'style' (default for new images), 'subject', 'composition', 'logo', 'character', 'product', " +
+        "'brand', 'edit' (default for edits), or a short free-text instruction.",
+    ),
+  aspect_ratio: z.string().optional().describe("e.g. '1:1', '3:2', '2:3', '4:5', '16:9', '9:16'. Presets have sensible defaults."),
+  transparent_background: z.boolean().optional().describe("Ask for a transparent PNG (logos, icons, stickers, cut-outs)."),
+  raw: z.boolean().optional().describe("Send the prompt verbatim with no wrapper (advanced)."),
 };
 
 const commonShape = {
@@ -65,7 +91,9 @@ export function createServer(manager: JobManager, opts: ServerOptions = {}): Mcp
         "Images are saved to disk; read the returned paths (or set return_images) to look at them. " +
         `Calls return within ~${config.maxCallWaitSec}s; if all_finished is false the images are still generating — ` +
         "call wait_for_jobs (no arguments) until all_finished is true. That's normal, not an error. " +
-        "When images finish, show them to the user (e.g. send the saved files with your file-sharing tool).",
+        "When images finish, show them to the user (e.g. send the saved files with your file-sharing tool). " +
+        "Quality: use presets (list_presets), proven wording (search_prompts), one subject per image, exact text in `text`. " +
+        "Images the user attaches in chat can be passed as reference_images (their file path). Brand identities: generate_brand_kit.",
     },
   );
 
@@ -136,7 +164,8 @@ export function createServer(manager: JobManager, opts: ServerOptions = {}): Mcp
         "Generate one or many images with ChatGPT. Each job runs in its OWN NEW chat, and all jobs in one call generate " +
         "in parallel (send 10-20 at once for variations or a whole asset set). Returns saved file paths plus a chat_id per " +
         "image for follow-up edits via edit_images. Typical time: 30-120 s; if the call returns before everything is done, " +
-        "call wait_for_jobs until all_finished is true.",
+        "call wait_for_jobs until all_finished is true. For quality, pick a preset (list_presets) and/or borrow proven wording " +
+        "via search_prompts. Attach user-provided images with reference_images.",
       inputSchema: {
         jobs: z.array(z.object(jobShape)).min(1).max(50).describe("One entry per image/chat."),
         model: z.string().optional().describe("Optional ChatGPT model slug for the new chats (default: account default)."),
@@ -246,6 +275,108 @@ export function createServer(manager: JobManager, opts: ServerOptions = {}): Mcp
   );
 
   server.registerTool(
+    "list_presets",
+    {
+      title: "List prompt presets and styles",
+      description:
+        "Prompt presets (brand, logo, mascot, product, fashion, portrait, interior, architecture, garden, vehicles, nature, macro, food, " +
+        "backgrounds, video start frames, UI/layout, illustration…) plus style modifiers and the core prompting rules. Use a preset id in " +
+        "generate_images/edit_images jobs. Call this before writing image prompts if you haven't yet.",
+      inputSchema: { category: z.string().optional().describe("Filter by category, e.g. 'brand', 'product', 'interior'.") },
+    },
+    async (args) => {
+      const list = PRESETS.filter((p) => !args.category || p.category === args.category.toLowerCase());
+      const payload = {
+        rules: PROMPTING_RULES,
+        presets: list.map((p) => ({ id: p.id, name: p.name, category: p.category, describe: p.describe, default_aspect: p.aspect, transparent: p.transparent || undefined })),
+        styles: STYLES.map((st) => `${st.id}: ${st.text}`),
+        reference_usage: Object.keys(REFERENCE_USES),
+        brand_identities: "Use generate_brand_kit: logo system first, then every asset generated from it (consistent, not one crowded board).",
+      };
+      return { content: [{ type: "text" as const, text: JSON.stringify(payload, null, 1) }] };
+    },
+  );
+
+  server.registerTool(
+    "search_prompts",
+    {
+      title: "Search proven example prompts",
+      description:
+        "Search ~17,000 real-world image prompts (open collections: EvoLink CC0, ZeroLu MIT, YouMind MIT) with sample-image links. " +
+        "Use to borrow structure and wording that's known to work for a subject (e.g. 'perfume ad', 'isometric room', 'character sheet', " +
+        "'youtube thumbnail'), then adapt it — don't copy blindly. Categories include portrait, poster, ui, ecommerce, ad-creative, character, " +
+        "product-marketing, profile-avatar, social-media-post, infographic, game-asset, comic-storyboard, app-web-design.",
+      inputSchema: {
+        query: z.string().min(1),
+        category: z.string().optional(),
+        source: z.enum(["all", "bundled", "youmind"]).default("all").describe("'bundled' is instant and offline; 'youmind' downloads ~47 MB once and caches it."),
+        limit: z.number().int().min(1).max(20).default(5),
+      },
+    },
+    async (args) => {
+      const r = await searchPrompts({ query: args.query, category: args.category, source: args.source, limit: args.limit });
+      return { content: [{ type: "text" as const, text: JSON.stringify(r, null, 1) }] };
+    },
+  );
+
+  server.registerTool(
+    "generate_brand_kit",
+    {
+      title: "Generate a consistent brand identity kit",
+      description:
+        "Brand identity done properly: for each creative direction, first generates a logo-system sheet (logo, palette, type), then " +
+        "generates every requested asset FROM that sheet (attached as a reference) so all assets share one logo, palette and type. " +
+        "Assets default to app icon, stationery, social post, website hero, packaging and signage. All directions run in parallel; " +
+        "assets start as soon as their logo sheet is ready. Collect with wait_for_jobs.",
+      inputSchema: {
+        brand_name: z.string().min(1).describe("Exact brand name (spelled as it must appear)."),
+        brief: z.string().min(1).describe("What the company does, audience, personality, positioning, must-haves."),
+        directions: z
+          .array(z.string())
+          .max(6)
+          .optional()
+          .describe("Distinct creative directions, one per kit (e.g. '1970s Swiss modernist, orange/cream/navy', 'wabi-sabi ceramics, ash and celadon'). Default: one direction from the brief."),
+        assets: z
+          .array(z.string())
+          .optional()
+          .describe(`Asset preset ids. Default: ${DEFAULT_KIT.join(", ")}. Any preset id works (e.g. 'brand-merch', 'brand-pattern', 'mascot').`),
+        reference_images: z.array(z.string()).optional().describe("Existing logo / inspiration images (paths, URLs or data URIs)."),
+        reference_usage: z.string().optional().describe("How to use those references for the logo sheet (default 'style'; use 'logo' to keep an existing logo)."),
+        ...commonShape,
+      },
+    },
+    async (args, extra) => {
+      const dirs = args.directions?.length ? args.directions : [""];
+      const assets = args.assets?.length ? args.assets : DEFAULT_KIT;
+      const unknown = assets.filter((a) => !PRESETS.some((p) => p.id === a));
+      if (unknown.length) {
+        return { content: [{ type: "text" as const, text: `Unknown asset preset(s): ${unknown.join(", ")}. Call list_presets for ids.` }], isError: true };
+      }
+      if (dirs.length * (assets.length + 1) > 42) {
+        return { content: [{ type: "text" as const, text: "Too many images: directions × (assets + 1) must be ≤ 42." }], isError: true };
+      }
+      const jobs: Job[] = [];
+      dirs.forEach((dir, d) => {
+        const tag = dirs.length > 1 ? `d${d + 1}-` : "";
+        const brief = `Brand "${args.brand_name}". ${args.brief}${dir ? ` Creative direction: ${dir}.` : ""}`;
+        const base = manager.submit({
+          ...toSpec("generate", { prompt: brief, preset: "brand-logo-system", text: args.brand_name, label: `${tag}${slug(args.brand_name)}-logo-system`, reference_images: args.reference_images, reference_usage: args.reference_usage }, args),
+        });
+        jobs.push(base);
+        for (const a of assets) {
+          jobs.push(
+            manager.submit({
+              ...toSpec("generate", { prompt: `${brief} Apply this brand identity to the asset.`, preset: a, label: `${tag}${slug(args.brand_name)}-${a}`, reference_usage: "brand" }, args),
+              dependsOn: base.id,
+            }),
+          );
+        }
+      });
+      return waitAndRender(jobs, args, progressSender(extra));
+    },
+  );
+
+  server.registerTool(
     "list_chats",
     {
       title: "List image chats",
@@ -311,6 +442,10 @@ export function toSpec(kind: "generate" | "edit", j: any, args: any): JobSpec {
     aspectRatio: j.aspect_ratio,
     transparent: j.transparent_background,
     raw: j.raw,
+    preset: j.preset,
+    styles: j.styles,
+    text: j.text,
+    referenceUsage: j.reference_usage,
     outputDir: args.output_dir,
     model: args.model,
     timeoutSec: config.timeoutSec,

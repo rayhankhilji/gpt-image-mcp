@@ -89,7 +89,7 @@ try {
 
   await step("lists tools", async () => {
     const { tools } = await client.listTools();
-    assert.deepEqual(tools.map((t) => t.name).sort(), ["chatgpt_status", "edit_images", "generate_images", "get_chat_images", "list_chats", "wait_for_jobs"]);
+    assert.deepEqual(tools.map((t) => t.name).sort(), ["chatgpt_status", "edit_images", "generate_brand_kit", "generate_images", "get_chat_images", "list_chats", "list_presets", "search_prompts", "wait_for_jobs"]);
   });
 
   await step("chatgpt_status", async () => {
@@ -177,9 +177,47 @@ try {
     console.log(`   7 chats fetched in ${((Date.now() - t) / 1000).toFixed(1)}s`);
   });
 
+  await step("list_presets + search_prompts (bundled library)", async () => {
+    const p = parse(await client.callTool({ name: "list_presets", arguments: {} }));
+    assert.ok(p.presets.length >= 50 && p.styles.length >= 40 && p.rules.length >= 5, `${p.presets.length} presets, ${p.styles.length} styles`);
+    const r = parse(await client.callTool({ name: "search_prompts", arguments: { query: "isometric room", source: "bundled", limit: 3 } }));
+    assert.ok(r.results.length >= 1 && r.results[0].prompt.length > 20, JSON.stringify(r).slice(0, 300));
+    console.log(`   ${p.presets.length} presets, ${p.styles.length} styles; search top hit: "${r.results[0].title}"`);
+  });
+
+  await step("preset + styles + exact text + references (data URI and URL) shape the sent prompt", async () => {
+    const before = stats.uploads;
+    const dataUri = "data:image/png;base64," + fs.readFileSync(ref).toString("base64");
+    const r = parse(await client.callTool({
+      name: "generate_images",
+      arguments: { return_images: false, jobs: [{ prompt: "a ceramic pour-over coffee dripper", preset: "product-hero", styles: ["golden-hour", "minimal-luxury"], text: "SLOW MORNINGS", reference_images: [dataUri, `${base}/mock/blob/refimg`], reference_usage: "product", label: "preset-test" }] },
+    }, undefined, { timeout: 200_000 }));
+    let res = r;
+    for (let i = 0; i < 10 && !res.all_finished; i++) res = parse(await client.callTool({ name: "wait_for_jobs", arguments: { return_images: false } }));
+    assert.equal(res.jobs[0].status, "done", JSON.stringify(res));
+    const sent = stats.texts.at(-1);
+    for (const needle of ["Intended use: hero image for a product launch ad", "Subject: a ceramic pour-over", "Key details:", "warm low golden-hour", '"SLOW MORNINGS"', "Reference: The attached image is the real product", "Avoid:", "Aspect ratio: 16:9"]) {
+      assert.ok(sent.text.includes(needle), `sent prompt missing ${needle}:\n${sent.text}`);
+    }
+    assert.equal(stats.uploads - before, 2, "both references uploaded");
+  });
+
+  await step("generate_brand_kit: logo sheet first, assets built from it", async () => {
+    const before = stats.uploads;
+    const r = parse(await client.callTool({ name: "generate_brand_kit", arguments: { brand_name: "Tarphon", brief: "AI logistics startup for small fleets; confident, calm", assets: ["brand-app-icon", "brand-social-post"], return_images: false } }));
+    assert.equal(r.jobs.length, 3);
+    assert.ok(r.jobs.slice(1).every((j) => j.status === "waiting" || j.status === "done" || j.status === "opening" || j.status === "sending" || j.status === "generating"), JSON.stringify(r.counts));
+    let res = r;
+    for (let i = 0; i < 15 && !res.all_finished; i++) res = parse(await client.callTool({ name: "wait_for_jobs", arguments: { job_ids: r.jobs.map((j) => j.job_id), return_images: false } }));
+    assert.equal(res.counts.done, 3, JSON.stringify(res.counts));
+    assert.equal(stats.uploads - before, 2, "each asset got the logo sheet attached");
+    const assetPrompt = stats.texts.at(-1).text;
+    assert.ok(assetPrompt.includes("identity sheet") && assetPrompt.includes('Brand "Tarphon"'), assetPrompt);
+  });
+
   await step("list_chats", async () => {
     const r = parse(await client.callTool({ name: "list_chats", arguments: { limit: 50 } }));
-    assert.equal(r.chats.length, 12);
+    assert.ok(r.chats.length >= 12);
     const c1 = r.chats.find((c) => c.label === "cabin-1");
     assert.equal(c1.turns.length, 3);
   });

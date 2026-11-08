@@ -6,7 +6,7 @@ import zlib from "node:zlib";
 import { randomUUID, randomBytes, createHash } from "node:crypto";
 
 const conversations = new Map(); // id -> { mapping, current_node, title, generating }
-const stats = { sends: 0, maxConcurrent: 0, concurrent: 0, uploads: 0, unauthorized: 0, apiRequests: 0, rateLimited: 0 };
+const stats = { texts: [], sends: 0, maxConcurrent: 0, concurrent: 0, uploads: 0, unauthorized: 0, apiRequests: 0, rateLimited: 0 };
 // Like ChatGPT: the account gets 429s when its data endpoints are hammered (default 2.5 req/s over 10 s).
 const RATE_LIMIT = Number(process.env.MOCK_RATE_LIMIT ?? 25);
 let windowStart = Date.now(), windowCount = 0;
@@ -65,6 +65,7 @@ function newConversation() {
 
 function handleSend(conv, text, attachments) {
   stats.sends++;
+  stats.texts.push({ text, attachments: attachments.length });
   const userParts = [...attachments.map((a) => ({ content_type: "image_asset_pointer", asset_pointer: `sediment://${a}`, width: 64, height: 64 })), text];
   const userId = append(conv, msg("user", { content_type: attachments.length ? "multimodal_text" : "text", parts: userParts }));
   if (conv.title === "New chat") conv.title = text.replace(/^Generate an image\..*?\n\n/s, "").slice(0, 30);
@@ -117,6 +118,8 @@ function sync() {
   if (uploading || (!cid() && slotBusy())) btn.setAttribute('aria-disabled', 'true'); else btn.removeAttribute('aria-disabled');
 }
 ta.addEventListener('input', sync);
+// Like the real composer: Enter sends, Shift+Enter is a newline.
+ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sync(); btn.click(); } });
 window.addEventListener('storage', sync);
 setInterval(sync, 500);
 fi.addEventListener('change', async () => {

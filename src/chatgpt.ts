@@ -438,15 +438,70 @@ async function locate(page: Page, list: string[], { visible = true } = {}) {
   return page.locator(css(list)).first();
 }
 
+/** Attach files and wait until their upload requests have finished (not a fixed sleep). */
+async function uploadFiles(page: Page, files: string[]): Promise<void> {
+  const inflight = new Set<unknown>();
+  let started = 0;
+  const isUpload = (r: { method(): string; url(): string }) =>
+    r.method() !== "GET" && /upload|\/files|blob\.core|oaiusercontent|sediment/i.test(r.url());
+  const onReq = (r: any) => {
+    if (isUpload(r)) {
+      inflight.add(r);
+      started++;
+    }
+  };
+  const onEnd = (r: any) => inflight.delete(r);
+  page.on("request", onReq);
+  page.on("requestfinished", onEnd);
+  page.on("requestfailed", onEnd);
+  try {
+    const input = await locate(page, SEL.fileInput, { visible: false });
+    await input.setInputFiles(files);
+    const t0 = Date.now();
+    let idleSince = 0;
+    while (Date.now() - t0 < 90_000) {
+      await sleep(250);
+      if (!started) {
+        if (Date.now() - t0 > 8000) break; // no visible upload traffic — carry on
+        continue;
+      }
+      if (inflight.size === 0) {
+        idleSince ||= Date.now();
+        if (Date.now() - idleSince > 1200) break;
+      } else idleSince = 0;
+    }
+    debug(`upload: ${started} request(s), settled after ${Date.now() - t0}ms`);
+  } finally {
+    page.off("request", onReq);
+    page.off("requestfinished", onEnd);
+    page.off("requestfailed", onEnd);
+  }
+}
+
+async function confirmSent(page: Page, timeoutMs: number): Promise<boolean> {
+  // Composer empties, stop button shows, or URL becomes /c/<id>. Polled from Node (in-page timers throttle in background tabs).
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const ok = await page
+      .evaluate(
+        ({ comp, stop }) => {
+          const c = document.querySelector(comp) as HTMLElement | null;
+          const empty = !c || ((c as HTMLTextAreaElement).value ?? c.innerText ?? "").trim() === "";
+          return empty || !!document.querySelector(stop) || /\/c\/[0-9a-zA-Z-]{8,}/.test(location.pathname);
+        },
+        { comp: css(SEL.composer), stop: css(SEL.stopButton) },
+      )
+      .catch(() => false);
+    if (ok) return true;
+    if (Date.now() > deadline) return false;
+    await sleep(200);
+  }
+}
+
 export async function sendPrompt(page: Page, prompt: string, files: string[] = []): Promise<void> {
   await page.locator(css(SEL.composer)).first().waitFor({ state: "visible", timeout: 60_000 });
   const composer = await locate(page, SEL.composer);
-
-  if (files.length) {
-    const input = await locate(page, SEL.fileInput, { visible: false });
-    await input.setInputFiles(files);
-    await sleep(1500); // let the upload state kick in so the send button disables
-  }
+  if (files.length) await uploadFiles(page, files);
 
   // Focus via DOM (immune to overlays), clear, then type. insertText = one input event, not N keystrokes.
   await composer.evaluate((el) => (el as HTMLElement).focus());
@@ -458,9 +513,12 @@ export async function sendPrompt(page: Page, prompt: string, files: string[] = [
     if (i < lines.length - 1) await page.keyboard.press("Shift+Enter");
   }
 
-  // Wait for send to become enabled (it stays disabled while attachments upload). Fail fast otherwise.
-  const deadline = Date.now() + (files.length ? 120_000 : 2_500);
-  let clicked = false;
+  // 1) Enter — what works on the live logged-in composer. 2) If nothing left, click the send button.
+  await composer.evaluate((el) => (el as HTMLElement).focus());
+  await page.keyboard.press("Enter");
+  if (await confirmSent(page, 2500)) return;
+
+  const deadline = Date.now() + (files.length ? 60_000 : 12_000);
   while (Date.now() < deadline) {
     const send = await locate(page, SEL.sendButton, { visible: false });
     const ready = await send
@@ -470,43 +528,12 @@ export async function sendPrompt(page: Page, prompt: string, files: string[] = [
         return !el.hidden && r.width > 0 && !el.disabled && el.getAttribute("aria-disabled") !== "true";
       }, undefined, { timeout: 1000 })
       .catch(() => false);
-    if (ready) {
-      // force: skip Playwright's "stable" check, which waits on animation frames that background tabs never render.
-      // Still a real (trusted) mouse click dispatched via CDP.
-      await send.click({ timeout: 5000, force: true }).then(
-        () => (clicked = true),
-        () => {},
-      );
-      if (clicked) break;
-    }
-    await sleep(300);
+    // force: skip Playwright's "stable" check (needs animation frames background tabs never render). Still a trusted CDP click.
+    if (ready) await send.click({ timeout: 5000, force: true }).catch(() => {});
+    if (await confirmSent(page, 1500)) return;
   }
-  if (!clicked) {
-    await composer.evaluate((el) => (el as HTMLElement).focus());
-    await page.keyboard.press("Enter");
-  }
-
-  // Confirm the message actually left: composer empties, stop button shows, or URL becomes /c/<id>.
-  // Polled from Node — in-page timers are throttled in background tabs.
-  let ok = false;
-  const confirmDeadline = Date.now() + 15_000;
-  while (!ok && Date.now() < confirmDeadline) {
-    ok = await page
-      .evaluate(
-        ({ comp, stop }) => {
-          const c = document.querySelector(comp) as HTMLElement | null;
-          const empty = !c || ((c as HTMLTextAreaElement).value ?? c.innerText ?? "").trim() === "";
-          return empty || !!document.querySelector(stop) || /\/c\/[0-9a-zA-Z-]{8,}/.test(location.pathname);
-        },
-        { comp: css(SEL.composer), stop: css(SEL.stopButton) },
-      )
-      .catch(() => false);
-    if (!ok) await sleep(250);
-  }
-  if (!ok) {
-    const sig = await pageSignals(page).catch(() => null);
-    throw new Error(`Prompt did not send.${sig?.errorText ? " Page says: " + sig.errorText : ""}`);
-  }
+  const sig = await pageSignals(page).catch(() => null);
+  throw new Error(`Prompt did not send.${sig?.errorText ? " Page says: " + sig.errorText : ""}`);
 }
 
 export async function waitForConversationId(page: Page, timeoutMs = 45_000): Promise<string> {

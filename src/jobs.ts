@@ -9,6 +9,7 @@ import {
   analyzeTurn,
   apiCoolingDown,
   captureDebug,
+  NotLoggedInError,
   chatUrl,
   conversationIdFromUrl,
   countUserMessages,
@@ -27,8 +28,10 @@ import {
   type TurnState,
 } from "./chatgpt.js";
 import { StateStore, type SavedImage } from "./state.js";
+import { getPreset, getStyle, REFERENCE_USES } from "./presets.js";
 
 export type JobStatus =
+  | "waiting"
   | "queued"
   | "opening"
   | "sending"
@@ -40,6 +43,7 @@ export type JobStatus =
   | "error";
 
 const FINAL: JobStatus[] = ["done", "no_image", "timeout", "error"];
+export const isFinal = (s: JobStatus) => FINAL.includes(s);
 
 export interface JobSpec {
   kind: "generate" | "edit";
@@ -55,6 +59,16 @@ export interface JobSpec {
   raw?: boolean;
   model?: string;
   timeoutSec?: number;
+  /** Preset id from presets.ts — structures the prompt for a use case. */
+  preset?: string;
+  /** Style modifier ids (or free-text styles). */
+  styles?: string[];
+  /** Exact text to render in the image. */
+  text?: string;
+  /** How to use the reference image(s): style | subject | composition | logo | edit | character | product | brand, or free text. */
+  referenceUsage?: string;
+  /** Start only after this job finishes, and attach its first image as a reference (e.g. logo → brand assets). */
+  dependsOn?: string;
 }
 
 export interface Job extends JobSpec {
@@ -132,8 +146,12 @@ export class JobManager {
       spec.chatId = normalizeChatId(spec.chatId);
     }
     for (const f of spec.referenceImages ?? []) {
-      if (!fs.existsSync(f)) throw new Error(`reference image not found: ${f}`);
+      if (!/^(https?:|data:image\/)/i.test(f) && !fs.existsSync(f)) throw new Error(`reference image not found: ${f}`);
     }
+    if (spec.preset && !getPreset(spec.preset)) {
+      throw new Error(`unknown preset "${spec.preset}". Call list_presets to see the options.`);
+    }
+    if (spec.dependsOn && !this.jobs.has(spec.dependsOn)) throw new Error(`unknown dependsOn job ${spec.dependsOn}`);
     const id = "job_" + randomBytes(4).toString("hex");
     const job = { ...spec, id, status: "queued", images: [], createdAt: Date.now() } as unknown as Job;
     this.jobs.set(id, job);
@@ -198,9 +216,20 @@ export class JobManager {
       }
     }
     this.refillWarm();
-    const page = await this.browser.newIsolatedPage();
-    await openUrl(page, newChatUrl(model));
-    return page;
+    for (let attempt = 1; ; attempt++) {
+      const page = await this.browser.newIsolatedPage();
+      try {
+        await openUrl(page, newChatUrl(model));
+        return page;
+      } catch (err) {
+        const shot = await captureDebug(page, `open-failed-${attempt}`);
+        await page.close().catch(() => {});
+        if (attempt >= 2 || err instanceof NotLoggedInError) {
+          throw new Error(`${(err as Error).message}${shot ? ` (screenshot: ${shot})` : ""}`);
+        }
+        log(`ChatGPT page didn't load (${(err as Error).message.split("\n")[0]}) — retrying with a fresh tab`);
+      }
+    }
   }
 
   get(id: string): Job | undefined {
@@ -318,6 +347,26 @@ export class JobManager {
   // ---------------------------------------------------------------- internals
 
   private async run(job: Job): Promise<void> {
+    if (job.dependsOn) {
+      job.status = "waiting";
+      const dep = this.jobs.get(job.dependsOn)!;
+      await dep.done.catch(() => {});
+      if (dep.status !== "done" || !dep.images.length) {
+        job.status = "error";
+        job.error = `Skipped: the job it builds on (${dep.id}, ${dep.label ?? "base image"}) ended with status ${dep.status}.`;
+        job.finishedAt = Date.now();
+        return;
+      }
+      job.referenceImages = [...(job.referenceImages ?? []), dep.images[0].path];
+    }
+    try {
+      job.referenceImages = await this.resolveRefs(job);
+    } catch (err) {
+      job.status = "error";
+      job.error = (err as Error).message;
+      job.finishedAt = Date.now();
+      return;
+    }
     job.status = this.sem.available > 0 ? "opening" : "queued";
     await this.sem.acquire();
     let page: Page | undefined;
@@ -578,6 +627,36 @@ export class JobManager {
     }
   }
 
+  /** Reference images may be local paths, http(s) URLs, or data: URIs (e.g. an image pasted into the chat). */
+  private async resolveRefs(job: Job): Promise<string[]> {
+    const refs = job.referenceImages ?? [];
+    if (!refs.some((r) => /^(https?:|data:image\/)/i.test(r))) return refs.map((r) => path.resolve(r));
+    const dir = path.join(this.resolveOutDir(job.outputDir), "_refs");
+    fs.mkdirSync(dir, { recursive: true });
+    const out: string[] = [];
+    for (const [i, r] of refs.entries()) {
+      const name = path.join(dir, `${job.id}-ref${i + 1}`);
+      if (/^data:image\//i.test(r)) {
+        const m = r.match(/^data:image\/([a-z0-9.+-]+);base64,(.*)$/is);
+        if (!m) throw new Error(`reference ${i + 1}: unsupported data URI`);
+        const buf = Buffer.from(m[2], "base64");
+        const file = `${name}.${sniffExt(buf)}`;
+        fs.writeFileSync(file, buf);
+        out.push(file);
+      } else if (/^https?:/i.test(r)) {
+        const res = await fetch(r, { signal: AbortSignal.timeout(60_000) });
+        if (!res.ok) throw new Error(`reference ${i + 1}: download failed (HTTP ${res.status}) for ${r}`);
+        const buf = Buffer.from(await res.arrayBuffer());
+        const file = `${name}.${sniffExt(buf)}`;
+        fs.writeFileSync(file, buf);
+        out.push(file);
+      } else {
+        out.push(path.resolve(r));
+      }
+    }
+    return out;
+  }
+
   private resolveOutDir(dir?: string): string {
     const d = path.resolve(dir || config.outputDir);
     fs.mkdirSync(d, { recursive: true });
@@ -594,15 +673,39 @@ export class JobManager {
 }
 
 export function buildPrompt(job: JobSpec): string {
-  const extras: string[] = [];
-  if (job.aspectRatio) extras.push(`Aspect ratio: ${job.aspectRatio}.`);
-  if (job.transparent) extras.push("Use a transparent background.");
-  const body = [job.prompt.trim(), extras.join(" ")].filter(Boolean).join("\n\n");
+  const preset = job.preset ? getPreset(job.preset) : undefined;
+  const styles = (job.styles ?? []).map((st) => getStyle(st)?.text ?? st);
+  const aspect = job.aspectRatio ?? preset?.aspect;
+  const transparent = job.transparent ?? preset?.transparent;
+  const hasRefs = Boolean(job.referenceImages?.length || job.dependsOn);
+  const parts: string[] = [];
+  if (preset) {
+    parts.push(`Intended use: ${preset.use}.`);
+    if (preset.scene) parts.push(`Scene: ${preset.scene}.`);
+    parts.push(`Subject: ${job.prompt.trim()}`);
+    parts.push(`Key details:\n${preset.details.map((d) => `- ${d}`).join("\n")}`);
+  } else {
+    parts.push(job.prompt.trim());
+  }
+  if (styles.length) parts.push(`Style: ${styles.join("; ")}.`);
+  if (job.text) parts.push(`Text: render exactly "${job.text}" — once, legibly, spelled exactly as written. No other text.`);
+  if (hasRefs) {
+    const usage = job.referenceUsage ?? (job.kind === "edit" ? "edit" : "style");
+    parts.push(`Reference: ${REFERENCE_USES[usage] ?? usage}`);
+  }
+  if (preset?.avoid.length) parts.push(`Avoid: ${preset.avoid.join("; ")}.`);
+  if (aspect) parts.push(`Aspect ratio: ${aspect}.`);
+  if (transparent) parts.push("Background: transparent (PNG cut-out) — no backdrop, no checkerboard.");
+  const body = parts.join("\n\n");
   if (job.raw) return body;
   if (job.kind === "generate") {
-    return `Generate an image. Don't ask clarifying questions — make sensible choices and create it right away.\n\n${body}`;
+    return (
+      "Create one image with your image generation tool from the brief below. Follow it closely — don't simplify or " +
+      "reinterpret it, don't ask questions, and don't answer with text only.\n\n" +
+      body
+    );
   }
-  return `${body}\n\n(Generate the updated image right away — no clarifying questions.)`;
+  return `${body}\n\n(Generate the updated image now. Keep everything not mentioned exactly the same.)`;
 }
 
 export function slug(s: string): string {
