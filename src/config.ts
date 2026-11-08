@@ -46,10 +46,18 @@ export const config = {
 
   /** Max chats generating at the same time. Extra jobs are queued. */
   maxConcurrency: Math.max(1, int(env.GPT_IMAGE_MAX_CONCURRENCY, 10)),
+  /** Ready-to-type ChatGPT tabs kept loaded by the server so new jobs start instantly. */
+  warmTabs: Math.max(0, int(env.GPT_IMAGE_WARM_TABS, 4)),
   /** Finished chats kept open as tabs so edits start instantly. */
   maxIdleTabs: Math.max(0, int(env.GPT_IMAGE_MAX_IDLE_TABS, 4)),
   /** Minimum gap between two prompt submissions (keeps bursts human-ish). */
-  sendGapMs: Math.max(0, int(env.GPT_IMAGE_SEND_GAP_MS, 1200)),
+  sendGapMs: Math.max(0, int(env.GPT_IMAGE_SEND_GAP_MS, 250)),
+  /**
+   * Longest a single MCP tool call blocks before returning partial results. Some clients
+   * (e.g. Claude Code on the web) abort tool calls after 60 s; jobs keep running in the background
+   * and the agent collects them with wait_for_jobs. Raise it if your client allows longer calls.
+   */
+  maxCallWaitSec: Math.max(5, int(env.GPT_IMAGE_MAX_CALL_WAIT, 50)),
   /** Default per-job timeout. */
   timeoutSec: Math.max(30, int(env.GPT_IMAGE_TIMEOUT, 600)),
   /** Optional model slug appended as ?model= on new chats (e.g. "gpt-4o", "gpt-5"). Empty = account default. */

@@ -179,7 +179,8 @@ try {
 
   await step("remote mode: serve --http with bearer token + image download URLs", async () => {
     const hport = port + 1;
-    const proc = spawn("node", [cli, "serve", "--http", "--port", String(hport), "--token", "s3cret"], { env, stdio: ["ignore", "inherit", "inherit"] });
+    // Short per-call cap: exercises "return partial results, then collect with wait_for_jobs" (client 60 s timeouts).
+    const proc = spawn("node", [cli, "serve", "--http", "--port", String(hport), "--token", "s3cret"], { env: { ...env, GPT_IMAGE_MAX_CALL_WAIT: "5" }, stdio: ["ignore", "inherit", "inherit"] });
     try {
       const url = new URL(`http://127.0.0.1:${hport}/mcp`);
       for (let i = 0; i < 50; i++) {
@@ -189,7 +190,13 @@ try {
       assert.equal(noAuth.status, 401);
       const hc = new Client({ name: "e2e-http", version: "0" });
       await hc.connect(new StreamableHTTPClientTransport(url, { requestInit: { headers: { authorization: "Bearer s3cret" } } }));
-      const r = parse(await hc.callTool({ name: "generate_images", arguments: { jobs: [{ prompt: "remote test", label: "remote" }] } }, undefined, { timeout: 200_000 }));
+      const t0 = Date.now();
+      const first = parse(await hc.callTool({ name: "generate_images", arguments: { jobs: [{ prompt: "remote test", label: "remote" }], timeout_seconds: 600 } }));
+      assert.ok(Date.now() - t0 < 9000, "call returned within the cap despite asking for 600 s");
+      assert.equal(first.all_finished, false);
+      assert.match(first.hint, /wait_for_jobs/);
+      let r = first;
+      for (let i = 0; i < 20 && !r.all_finished; i++) r = parse(await hc.callTool({ name: "wait_for_jobs", arguments: {} }));
       assert.equal(r.counts.done, 1, JSON.stringify(r));
       const imgUrl = r.jobs[0].images[0].url;
       assert.ok(imgUrl, "HTTP results carry a download url");

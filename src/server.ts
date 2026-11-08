@@ -44,11 +44,14 @@ const commonShape = {
     .min(5)
     .max(3600)
     .optional()
-    .describe("Max seconds this call waits. Jobs that aren't done keep running in the background."),
+    .describe(
+      `Max seconds this call blocks (capped at ${config.maxCallWaitSec}s so it never hits client tool timeouts). ` +
+        "Unfinished jobs keep running — collect them with wait_for_jobs.",
+    ),
   return_images: z
     .boolean()
-    .default(false)
-    .describe("Also return small JPEG previews inline so you can look at the results (costs image tokens). Files are always saved either way."),
+    .default(true)
+    .describe("Return small JPEG previews inline (~500 tokens each) so you can see the results. Set false to save tokens. Files are always saved."),
 };
 
 export function createServer(manager: JobManager, opts: ServerOptions = {}): McpServer {
@@ -59,16 +62,26 @@ export function createServer(manager: JobManager, opts: ServerOptions = {}): Mcp
         "Generates images with the user's own ChatGPT account (uses their plan's image quota, not API credits). " +
         "Each generate job opens a NEW ChatGPT chat; many jobs in one call run in parallel. " +
         "Every result has a chat_id — pass it to edit_images to iterate on that exact image with full chat context. " +
-        "Images are saved to disk; read the returned paths (or set return_images) to look at them.",
+        "Images are saved to disk; read the returned paths (or set return_images) to look at them. " +
+        `Calls return within ~${config.maxCallWaitSec}s; if all_finished is false the images are still generating — ` +
+        "call wait_for_jobs (no arguments) until all_finished is true. That's normal, not an error. " +
+        "When images finish, show them to the user (e.g. send the saved files with your file-sharing tool).",
     },
   );
 
   // ------------------------------------------------------------------ helpers
 
+  const previewed = new Set<string>();
+
   async function render(jobs: Job[], finished: boolean, returnImages: boolean, extra: Record<string, unknown> = {}) {
     const payload = { ...extra, ...buildPayload(jobs, finished, opts.fileUrl) };
     const content: Content[] = [{ type: "text", text: JSON.stringify(payload, null, 2) }];
-    if (returnImages) content.push(...(await previews(jobs.flatMap((j) => j.images))));
+    if (returnImages) {
+      // Each preview is sent once per session — later polls don't repeat images already shown.
+      const fresh = jobs.flatMap((j) => j.images).filter((i) => !previewed.has(i.path));
+      fresh.forEach((i) => previewed.add(i.path));
+      content.push(...(await previews(fresh)));
+    }
     return { content, isError: jobs.length > 0 && jobs.every((j) => j.status === "error") };
   }
 
@@ -92,7 +105,7 @@ export function createServer(manager: JobManager, opts: ServerOptions = {}): Mcp
     send: ReturnType<typeof progressSender>,
   ) {
     if (args.wait === false) return render(jobs, false, false);
-    const timeoutMs = (args.timeout_seconds ?? config.timeoutSec) * 1000;
+    const timeoutMs = callWaitMs(args.timeout_seconds);
     const finished = await manager.waitFor(jobs, timeoutMs, (js) => progress(send, js));
     return render(jobs, finished, !!args.return_images);
   }
@@ -122,7 +135,8 @@ export function createServer(manager: JobManager, opts: ServerOptions = {}): Mcp
       description:
         "Generate one or many images with ChatGPT. Each job runs in its OWN NEW chat, and all jobs in one call generate " +
         "in parallel (send 10-20 at once for variations or a whole asset set). Returns saved file paths plus a chat_id per " +
-        "image for follow-up edits via edit_images. Typical time: 30-120 s.",
+        "image for follow-up edits via edit_images. Typical time: 30-120 s; if the call returns before everything is done, " +
+        "call wait_for_jobs until all_finished is true.",
       inputSchema: {
         jobs: z.array(z.object(jobShape)).min(1).max(50).describe("One entry per image/chat."),
         model: z.string().optional().describe("Optional ChatGPT model slug for the new chats (default: account default)."),
@@ -165,8 +179,14 @@ export function createServer(manager: JobManager, opts: ServerOptions = {}): Mcp
       description: "Check on or wait for jobs started with wait=false (or that outlasted a call's timeout). Omit job_ids to wait for everything still running.",
       inputSchema: {
         job_ids: z.array(z.string()).optional(),
-        timeout_seconds: z.number().int().min(0).max(3600).default(300).describe("0 = just report current status."),
-        return_images: z.boolean().default(false),
+        timeout_seconds: z
+          .number()
+          .int()
+          .min(0)
+          .max(3600)
+          .optional()
+          .describe(`Seconds to wait (default and max ${config.maxCallWaitSec}). 0 = just report current status.`),
+        return_images: z.boolean().default(true),
       },
     },
     async (args, extra) => {
@@ -182,7 +202,10 @@ export function createServer(manager: JobManager, opts: ServerOptions = {}): Mcp
         if (!jobs.length) jobs = manager.list().slice(-20);
       }
       const send = progressSender(extra);
-      const finished = args.timeout_seconds > 0 ? await manager.waitFor(jobs, args.timeout_seconds * 1000, (js) => progress(send, js)) : jobs.every((j) => ["done", "no_image", "timeout", "error"].includes(j.status));
+      const finished =
+        args.timeout_seconds !== 0
+          ? await manager.waitFor(jobs, callWaitMs(args.timeout_seconds), (js) => progress(send, js))
+          : jobs.every((j) => ["done", "no_image", "timeout", "error"].includes(j.status));
       return render(jobs, finished, args.return_images);
     },
   );
@@ -275,7 +298,7 @@ export function toSpec(kind: "generate" | "edit", j: any, args: any): JobSpec {
     raw: j.raw,
     outputDir: args.output_dir,
     model: args.model,
-    timeoutSec: Math.max(args.timeout_seconds ?? 0, config.timeoutSec),
+    timeoutSec: config.timeoutSec,
   };
 }
 
@@ -289,8 +312,19 @@ export function buildPayload(jobs: Job[], finished: boolean, fileUrl?: (p: strin
     all_finished: finished,
     counts: countBy(jobs.map((j) => j.status)),
     jobs: summaries,
-    ...(finished ? {} : { hint: "Some jobs are still running. Call wait_for_jobs with these job_ids to collect them." }),
+    ...(finished
+      ? {}
+      : {
+          hint:
+            "Still generating (normal — images take 30-120 s). Call wait_for_jobs again (no arguments needed) to collect them; " +
+            "repeat until all_finished is true.",
+        }),
   };
+}
+
+/** Per-call blocking time, never above maxCallWaitSec. */
+export function callWaitMs(requestedSec?: number): number {
+  return Math.min(requestedSec ?? config.maxCallWaitSec, config.maxCallWaitSec) * 1000;
 }
 
 export function countBy(xs: string[]): Record<string, number> {

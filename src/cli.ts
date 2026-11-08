@@ -102,6 +102,7 @@ async function serveStdio(): Promise<void> {
   process.stdin.on("close", () => void shutdown().then(() => process.exit(0)));
   await server.connect(new StdioServerTransport());
   logStartup("stdio");
+  manager.enablePrewarm(); // start Chrome + ready tabs now, so the first request has no startup delay
 }
 
 async function serveHttpCmd(values: Record<string, unknown>): Promise<void> {
@@ -116,6 +117,7 @@ async function serveHttpCmd(values: Record<string, unknown>): Promise<void> {
   }
   const manager = new JobManager();
   onExit(() => manager.shutdown());
+  manager.enablePrewarm();
   await serveHttp(manager, { host, port, token: token || undefined, publicUrl: (values["public-url"] as string) || process.env.GPT_IMAGE_PUBLIC_URL });
 }
 

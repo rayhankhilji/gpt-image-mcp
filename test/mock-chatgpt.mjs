@@ -71,7 +71,7 @@ function handleSend(conv, text, attachments) {
   const callId = append(conv, msg("assistant", { content_type: "code", text: "{\"prompt\":\"...\"}" }, { recipient: "t2uay3k.sj1i4kz", metadata: { image_gen_async: true, trigger_async_ux: true } }));
   append(conv, msg("tool", { content_type: "text", parts: ["Processing image"] }, { metadata: { image_gen_task_id: "task_" + randomBytes(4).toString("hex"), async_task_type: "image_gen" } }), callId);
   const count = /two images/i.test(text) ? 2 : 1;
-  const delay = Number(process.env.MOCK_GEN_MS ?? 9000) + Math.floor(Math.random() * 4000);
+  const delay = Number(process.env.MOCK_GEN_MS ?? 9000) + Math.floor(Math.random() * Number(process.env.MOCK_GEN_JITTER ?? 4000));
   setTimeout(() => {
     for (let i = 0; i < count; i++) {
       const fid = "file_" + randomBytes(12).toString("hex");
@@ -95,13 +95,21 @@ const PAGE = (loggedIn) => `<!doctype html><html><head><title>ChatGPT</title></h
 <script>
 const ta = document.getElementById('composer'), btn = document.querySelector('[data-composer-submit]'), fi = document.getElementById('octane-mobile-composer-files-input');
 let uploads = [], uploading = 0;
+// Like the real 2026 web app: ONE shared "new chat in progress" slot per browser profile (localStorage).
+// While another tab holds it, a new-chat tab's send button stays locked.
+const tabId = Math.random().toString(36).slice(2);
+function slotBusy() {
+  try { const v = JSON.parse(localStorage.getItem('mock-local-slot') || 'null'); return v && v.tab !== tabId && Date.now() - v.at < 8000; } catch { return false; }
+}
 function sync() {
   const gen = btn.hasAttribute('data-stop-generating');
   if (gen) return;
   btn.hidden = !ta.value.trim();
-  if (uploading) btn.setAttribute('aria-disabled', 'true'); else btn.removeAttribute('aria-disabled');
+  if (uploading || (!cid() && slotBusy())) btn.setAttribute('aria-disabled', 'true'); else btn.removeAttribute('aria-disabled');
 }
 ta.addEventListener('input', sync);
+window.addEventListener('storage', sync);
+setInterval(sync, 500);
 fi.addEventListener('change', async () => {
   for (const f of fi.files) {
     uploading++; sync();
@@ -110,7 +118,7 @@ fi.addEventListener('change', async () => {
   }
 });
 async function token() { return (await (await fetch('/api/auth/session')).json()).accessToken; }
-function cid() { const m = location.pathname.match(/\\/c\\/([\\w-]+)/); return m && m[1]; }
+function cid() { const m = location.pathname.match(/\\/c\\/([0-9a-f]{8}-[0-9a-f-]{27})/); return m && m[1]; }
 async function render() {
   const id = cid(); if (!id) return;
   const r = await fetch('/backend-api/conversation/' + id, { headers: { authorization: 'Bearer ' + await token() } });
@@ -133,11 +141,16 @@ btn.addEventListener('click', async (e) => {
   e.preventDefault();
   if (btn.getAttribute('aria-disabled') === 'true' || btn.hasAttribute('data-stop-generating')) return;
   const text = ta.value; ta.value = '';
+  const isNew = !cid();
+  if (isNew) {
+    localStorage.setItem('mock-local-slot', JSON.stringify({ tab: tabId, at: Date.now() }));
+    history.pushState({}, '', '/c/local-chatgpt'); // placeholder before the real id exists
+  }
   btn.setAttribute('data-stop-generating', ''); btn.setAttribute('aria-label', 'Stop generating');
   const r = await fetch('/mock/send', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ conversation_id: cid(), text, attachments: uploads }) });
   const { conversation_id } = await r.json();
   uploads = []; document.getElementById('att').textContent = '';
-  if (!cid()) history.pushState({}, '', '/c/' + conversation_id);
+  if (isNew) setTimeout(() => history.replaceState({}, '', '/c/' + conversation_id), 700);
   setTimeout(() => { btn.removeAttribute('data-stop-generating'); btn.setAttribute('aria-label', 'Send message'); sync(); }, 1500);
 });
 setInterval(render, 1000); render();

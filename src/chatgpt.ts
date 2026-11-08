@@ -28,8 +28,11 @@ export class NotLoggedInError extends Error {
 // Navigation & readiness
 // ---------------------------------------------------------------------------
 
+// Real conversation ids are UUIDs. The new web app first shows a placeholder (/c/local-chatgpt) — never accept that.
+const CONV_ID = /\/c\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i;
+
 export function conversationIdFromUrl(url: string): string | null {
-  const m = url.match(/\/c\/([0-9a-zA-Z-]{8,})/);
+  const m = url.match(CONV_ID);
   return m ? m[1] : null;
 }
 
@@ -385,8 +388,8 @@ export async function sendPrompt(page: Page, prompt: string, files: string[] = [
     if (i < lines.length - 1) await page.keyboard.press("Shift+Enter");
   }
 
-  // Wait for send to become enabled (it stays disabled while attachments upload).
-  const deadline = Date.now() + 120_000;
+  // Wait for send to become enabled (it stays disabled while attachments upload). Fail fast otherwise.
+  const deadline = Date.now() + (files.length ? 120_000 : 15_000);
   let clicked = false;
   while (Date.now() < deadline) {
     const send = await locate(page, SEL.sendButton, { visible: false });
@@ -416,7 +419,7 @@ export async function sendPrompt(page: Page, prompt: string, files: string[] = [
   // Confirm the message actually left: composer empties, stop button shows, or URL becomes /c/<id>.
   // Polled from Node — in-page timers are throttled in background tabs.
   let ok = false;
-  const confirmDeadline = Date.now() + 30_000;
+  const confirmDeadline = Date.now() + 15_000;
   while (!ok && Date.now() < confirmDeadline) {
     ok = await page
       .evaluate(
@@ -436,11 +439,14 @@ export async function sendPrompt(page: Page, prompt: string, files: string[] = [
   }
 }
 
-export async function waitForConversationId(page: Page, timeoutMs = 90_000): Promise<string> {
-  const existing = conversationIdFromUrl(page.url());
-  if (existing) return existing;
-  await page.waitForURL(/\/c\/[0-9a-zA-Z-]{8,}/, { timeout: timeoutMs });
-  return conversationIdFromUrl(page.url())!;
+export async function waitForConversationId(page: Page, timeoutMs = 45_000): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const id = conversationIdFromUrl(page.url());
+    if (id) return id;
+    await sleep(200);
+  }
+  throw new Error(`ChatGPT never assigned a chat id (still at ${new URL(page.url()).pathname}).`);
 }
 
 // ---------------------------------------------------------------------------

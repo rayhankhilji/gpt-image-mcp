@@ -31,6 +31,10 @@ export class BrowserManager {
   private starting: Promise<BrowserContext> | null = null;
   private ownedPages = new Set<Page>();
   private headless = false;
+  private launchArgs: string[] = [];
+  private launchExtra: Record<string, unknown> = {};
+  private workerBrowser: Browser | null = null;
+  private workerStarting: Promise<Browser> | null = null;
 
   constructor(private opts: { forceHeaded?: boolean } = {}) {}
 
@@ -84,6 +88,8 @@ export class BrowserManager {
       for (const extra of attempts) {
         try {
           ctx = await chromium.launchPersistentContext(config.profileDir, { ...base, ...extra });
+          this.launchArgs = args;
+          this.launchExtra = extra;
           debug("launched browser", extra);
           break;
         } catch (err) {
@@ -126,6 +132,56 @@ export class BrowserManager {
       await minimizeWindow(p).catch((e) => debug("minimize failed", e));
     }
     return ctx;
+  }
+
+  /**
+   * A page in its OWN browser context (like a separate incognito window) carrying the login cookies.
+   * ChatGPT's web app shares a single "new chat in progress" slot across tabs of one profile, so
+   * parallel new chats in ordinary tabs collide (placeholder /c/local-chatgpt, locked send button).
+   * Separate contexts have separate storage, so 10-20 chats can start at the same moment.
+   */
+  async newIsolatedPage(): Promise<Page> {
+    const main = await this.context();
+    const browser = await this.workers();
+    const wctx = await browser.newContext({
+      viewport: this.headless ? { width: 1280, height: 900 } : null,
+      acceptDownloads: true,
+    });
+    const cookies = await main.cookies();
+    if (cookies.length) await wctx.addCookies(cookies);
+    const page = await wctx.newPage();
+    this.ownedPages.add(page);
+    page.on("close", () => {
+      this.ownedPages.delete(page);
+      // Keep the saved login fresh: copy any rotated session cookies back into the profile.
+      void wctx
+        .cookies()
+        .then((c) => (this.ctx ? this.ctx.addCookies(c.filter((x) => /session-token|oai-/.test(x.name))) : undefined))
+        .catch(() => {})
+        .finally(() => wctx.close().catch(() => {}));
+    });
+    if (config.forceVisible) await page.addInitScript(FORCE_VISIBLE_SCRIPT);
+    if (!config.cdpUrl && !this.headless && config.window === "minimized") {
+      await minimizeWindow(page).catch((e) => debug("minimize failed", e));
+    }
+    page.setDefaultTimeout(30_000);
+    return page;
+  }
+
+  private async workers(): Promise<Browser> {
+    if (this.workerBrowser?.isConnected()) return this.workerBrowser;
+    if (config.cdpUrl && this.browser) return this.browser; // CDP browsers can create contexts directly
+    if (!this.workerStarting) {
+      this.workerStarting = chromium
+        .launch({ headless: this.headless, args: this.launchArgs, ...this.launchExtra })
+        .then((b) => {
+          this.workerBrowser = b;
+          b.on("disconnected", () => (this.workerBrowser = null));
+          return b;
+        })
+        .finally(() => (this.workerStarting = null));
+    }
+    return this.workerStarting;
   }
 
   async newPage(): Promise<Page> {
@@ -180,6 +236,14 @@ export class BrowserManager {
 
   async close(): Promise<void> {
     this.utility = null;
+    const workers = this.workerBrowser;
+    if (workers) {
+      // Let page-close handlers copy cookies back before the profile closes.
+      for (const p of [...this.ownedPages]) if (p.context() !== this.ctx) await p.close().catch(() => {});
+      await new Promise((r) => setTimeout(r, 300));
+      await workers.close().catch(() => {});
+      this.workerBrowser = null;
+    }
     const ctx = this.ctx;
     if (!ctx) return;
     try {

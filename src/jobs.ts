@@ -8,6 +8,7 @@ import {
   analyzeTurn,
   captureDebug,
   chatUrl,
+  conversationIdFromUrl,
   countUserMessages,
   downloadUrl,
   ensureReady,
@@ -68,7 +69,7 @@ export interface Job extends JobSpec {
   done: Promise<Job>;
 }
 
-const POLL_MS = 2500;
+const POLL_MS = 1000;
 const STABLE_MS = 5000; // image set must be unchanged this long
 const TEXT_ONLY_GRACE_MS = 20_000; // text-only answer must sit idle this long before we call it "no_image"
 
@@ -105,6 +106,9 @@ export class JobManager {
   private chatLocks = new Map<string, Promise<unknown>>();
   private idleTabs = new Map<string, Page>(); // chatId -> page (LRU by insertion order)
   private sendChain: Promise<unknown> = Promise.resolve();
+  private warm: Array<{ page: Page; at: number }> = [];
+  private warming = 0;
+  private warmTarget = 0;
   private lastSendAt = 0;
 
   constructor(browser?: BrowserManager) {
@@ -139,6 +143,55 @@ export class JobManager {
       job.done = run();
     }
     return job;
+  }
+
+  /**
+   * Keep a few ChatGPT "new chat" tabs loaded and ready, so a prompt can be typed the instant a job
+   * arrives (no browser start / page load on the critical path). Called by the long-running servers.
+   */
+  enablePrewarm(n = Math.min(config.warmTabs, config.maxConcurrency)): void {
+    this.warmTarget = n;
+    this.refillWarm();
+  }
+
+  private refillWarm(): void {
+    while (this.warm.length + this.warming < this.warmTarget) {
+      this.warming++;
+      (async () => {
+        const page = await this.browser.newIsolatedPage();
+        try {
+          await openUrl(page, newChatUrl());
+          this.warm.push({ page, at: Date.now() });
+        } catch (err) {
+          await page.close().catch(() => {});
+          throw err;
+        }
+      })()
+        .catch((err) => {
+          debug("prewarm failed:", (err as Error).message);
+          this.warmTarget = 0; // e.g. not logged in — don't retry in a loop
+        })
+        .finally(() => this.warming--);
+    }
+  }
+
+  /** A loaded, ready new-chat tab — from the warm pool when possible. */
+  private async freshChatPage(model?: string): Promise<Page> {
+    if (!model) {
+      while (this.warm.length) {
+        const { page, at } = this.warm.shift()!;
+        const fresh = Date.now() - at < 20 * 60_000;
+        if (fresh && !page.isClosed() && !conversationIdFromUrl(page.url())) {
+          this.refillWarm();
+          return page;
+        }
+        await page.close().catch(() => {});
+      }
+    }
+    this.refillWarm();
+    const page = await this.browser.newIsolatedPage();
+    await openUrl(page, newChatUrl(model));
+    return page;
   }
 
   get(id: string): Job | undefined {
@@ -180,6 +233,7 @@ export class JobManager {
   }
 
   async shutdown(): Promise<void> {
+    this.warmTarget = 0;
     this.state.flush();
     await this.browser.close();
   }
@@ -247,21 +301,31 @@ export class JobManager {
           baseUsers = baseDomUsers;
         }
       } else {
-        page = await this.browser.newPage();
-        await openUrl(page, newChatUrl(job.model));
+        page = await this.freshChatPage(job.model);
       }
 
       debug(`${job.id} page ready at +${Date.now() - job.createdAt}ms`);
-      job.status = "sending";
       const prompt = buildPrompt(job);
-      await this.throttledSend(async () => {
-        const t0 = Date.now();
-        await sendPrompt(page!, prompt, job.referenceImages ?? []);
-        debug(`${job.id} sent in ${Date.now() - t0}ms (at +${Date.now() - job.createdAt}ms)`);
-      });
-
-      job.status = "generating";
-      const chatId = await waitForConversationId(page);
+      let chatId = "";
+      for (let attempt = 1; ; attempt++) {
+        job.status = "sending";
+        await this.throttledSend(async () => {
+          const t0 = Date.now();
+          await sendPrompt(page!, prompt, job.referenceImages ?? []);
+          debug(`${job.id} sent in ${Date.now() - t0}ms (at +${Date.now() - job.createdAt}ms)`);
+        });
+        job.status = "generating";
+        try {
+          chatId = job.kind === "edit" ? job.chatId! : await waitForConversationId(page);
+          break;
+        } catch (err) {
+          // The send didn't create a chat (nothing was generated) — retry once in a fresh context.
+          if (attempt >= 2) throw err;
+          log(`${job.id}: ${(err as Error).message} — retrying in a fresh tab`);
+          await page.close().catch(() => {});
+          page = await this.freshChatPage(job.model);
+        }
+      }
       job.chatId = chatId;
       job.chatUrl = chatUrl(chatId);
       this.state.upsertChat(chatId, { url: job.chatUrl, label: job.kind === "generate" ? job.label : undefined });
@@ -369,7 +433,7 @@ export class JobManager {
 
       if (imgs.length) {
         // Fast path: ChatGPT marked the turn complete. Otherwise require the image set to sit still for STABLE_MS.
-        const turnComplete = !useDom && st?.endTurn && Date.now() - sigSince >= POLL_MS;
+        const turnComplete = !useDom && st?.endTurn;
         if (!generating && (turnComplete || Date.now() - sigSince >= STABLE_MS)) {
           return { mode: useDom ? "dom" : "api", st, domImages, timedOut: false, title };
         }
@@ -386,9 +450,9 @@ export class JobManager {
           quietSince = 0;
         }
       }
-      // Poll less often when many chats are generating (~3 req/s total at 20 parallel chats).
+      // 1 s polls; slower when many chats run at once (~4 req/s total at 20 parallel chats).
       const active = config.maxConcurrency - this.sem.available;
-      await sleep(Math.max(POLL_MS, active * 300));
+      await sleep(Math.max(POLL_MS, active * 250));
     }
     return { mode: apiFails >= 3 ? "dom" : "api", st, domImages, timedOut: true, title };
   }
@@ -419,7 +483,7 @@ export class JobManager {
         await idle.close().catch(() => {});
       }
     }
-    const page = await this.browser.newPage();
+    const page = await this.browser.newIsolatedPage();
     try {
       await openUrl(page, chatUrl(chatId));
     } catch (err) {
