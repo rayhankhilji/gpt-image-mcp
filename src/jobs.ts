@@ -282,6 +282,7 @@ export class JobManager {
   // ---------------------------------------------------------------- internals
 
   private async run(job: Job): Promise<void> {
+    job.status = this.sem.available > 0 ? "opening" : "queued";
     await this.sem.acquire();
     let page: Page | undefined;
     let keepTab = false;

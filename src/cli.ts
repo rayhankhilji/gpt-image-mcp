@@ -20,6 +20,7 @@ Usage:
         [--host 127.0.0.1] [--port 8787] [--token <secret>] [--public-url https://...]
   gpt-image-mcp login                    open a browser window and sign in to ChatGPT (one time)
   gpt-image-mcp status                   check login + plan
+  gpt-image-mcp diagnose [chat_id|url]   dump what the live ChatGPT page/endpoints return (for fixing breakages)
   gpt-image-mcp export-session [file]    save your login to a file (to move it to a server)
         [--env]                          also print a one-line GPT_IMAGE_SESSION value for cloud secrets
   gpt-image-mcp import-session <file|->  load a login from export-session, a Cookie-Editor export,
@@ -63,6 +64,8 @@ async function main(): Promise<void> {
       return login();
     case "status":
       return status();
+    case "diagnose":
+      return (await import("./diagnose.js")).diagnose(positionals[0]);
     case "export-session":
       return exportCmd(positionals[0] || "chatgpt-session.json", !!values.env);
     case "import-session":
