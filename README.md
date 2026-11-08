@@ -28,7 +28,8 @@ agent ──MCP / CLI / REST──▶ gpt-image-mcp ──▶ Chrome (your ChatG
 - **Sending** goes through the real ChatGPT page: it types into the composer and clicks send. ChatGPT's own front end handles its security checks, and your plan's quota is used.
 - **Reading** uses ChatGPT's internal JSON endpoints (`/backend-api/conversation/{id}`, `/backend-api/files/download/{id}`), called from inside the logged-in page. That's how it knows when an image is finished and gets the original file. The DOM is only a fallback.
 - **Parallel for real:** every chat runs in its own isolated browser context carrying your login. ChatGPT's web app shares one "new chat in progress" slot across tabs of a profile, so ordinary tabs would queue behind each other.
-- **No waiting on our side:** the server starts Chrome and keeps ready-to-type tabs loaded (`GPT_IMAGE_WARM_TABS`), polls every second, and finishes a job the moment ChatGPT marks the image done.
+- **No waiting on our side:** the server starts Chrome and keeps ready-to-type tabs loaded (`GPT_IMAGE_WARM_TABS`), and finishes a job the moment the image is done.
+- **Gentle on your account:** completion is detected mostly passively, from what the page itself renders and receives, which costs zero requests. ChatGPT's data endpoint is only asked occasionally, through one shared, adaptive rate limit. Polling it hard makes ChatGPT throttle the whole account (429, "Could not load this conversation") until it stops.
 
 ## Claude Code on the web: no terminal needed
 
@@ -214,7 +215,9 @@ To refine an image: gpt-image-mcp edit <chat_id> "<change>" --out ./images
 | `GPT_IMAGE_OUTPUT_DIR` | `$GPT_IMAGE_HOME/images` | default save folder |
 | `GPT_IMAGE_MAX_CONCURRENCY` | `10` | chats generating at once (extra jobs queue) |
 | `GPT_IMAGE_SEND_GAP_MS` | `250` | minimum gap between prompt submissions |
-| `GPT_IMAGE_WARM_TABS` | `4` | ready-to-type ChatGPT tabs the server keeps loaded so jobs start instantly |
+| `GPT_IMAGE_WARM_TABS` | `3` | ready-to-type ChatGPT tabs the server keeps loaded so jobs start instantly |
+| `GPT_IMAGE_API_GAP_MS` | `300` | starting gap between ChatGPT data requests; adapts automatically (slows down 2× on a 429, then eases back) |
+| `GPT_IMAGE_MAX_PAGE_LOADS` | `5` | ChatGPT pages loading at once |
 | `GPT_IMAGE_MAX_CALL_WAIT` | `50` | longest one tool call blocks (stays under 60 s client timeouts); unfinished jobs are collected with `wait_for_jobs` |
 | `GPT_IMAGE_TIMEOUT` | `600` | per-job timeout (seconds) |
 | `GPT_IMAGE_MAX_IDLE_TABS` | `4` | finished chats kept open for instant edits |

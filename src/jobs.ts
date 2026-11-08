@@ -5,7 +5,9 @@ import type { Page } from "playwright";
 import { BrowserManager } from "./browser.js";
 import { config, debug, log } from "./config.js";
 import {
+  activity,
   analyzeTurn,
+  apiCoolingDown,
   captureDebug,
   chatUrl,
   conversationIdFromUrl,
@@ -69,9 +71,13 @@ export interface Job extends JobSpec {
   done: Promise<Job>;
 }
 
-const POLL_MS = 1000;
+const POLL_MS = 1000; // DOM check interval (local only, no requests)
+const FIRST_CHECK_MS = 8_000; // first conversation check after sending (images take ~6-20 s)
+const BACKSTOP_MS = 15_000; // conversation check at least this often per job, even with no signal
+const MIN_FETCH_GAP_MS = 3_000; // ...and never more often than this per job
+const DOM_STABLE_MS = 4_000;
 const STABLE_MS = 5000; // image set must be unchanged this long
-const TEXT_ONLY_GRACE_MS = 20_000; // text-only answer must sit idle this long before we call it "no_image"
+const TEXT_ONLY_GRACE_MS = 8_000; // text-only answer must sit idle this long before we call it "no_image"
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -291,21 +297,21 @@ export class JobManager {
       job.status = "opening";
 
       let baseUsers = 0;
-      let baseDomUsers = 0;
       if (job.kind === "edit") {
         page = await this.takeTab(job.chatId!);
         const r = await fetchConversation(page, job.chatId!);
         if (r.ok && r.json?.mapping) baseUsers = countUserMessages(r.json);
-        baseDomUsers = (await pageSignals(page)).userMessages;
-        if (!r.ok) {
+        else {
           debug(`baseline via API failed (${r.status}); using DOM count`);
-          baseUsers = baseDomUsers;
+          baseUsers = (await pageSignals(page)).userMessages;
         }
       } else {
         page = await this.freshChatPage(job.model);
       }
 
       debug(`${job.id} page ready at +${Date.now() - job.createdAt}ms`);
+      // Images already on the page before we send (earlier turns) — so only new ones count.
+      const baselineDom = new Set((await pageSignals(page).catch(() => null))?.domImages ?? []);
       const prompt = buildPrompt(job);
       let chatId = "";
       for (let attempt = 1; ; attempt++) {
@@ -331,7 +337,7 @@ export class JobManager {
       job.chatUrl = chatUrl(chatId);
       this.state.upsertChat(chatId, { url: job.chatUrl, label: job.kind === "generate" ? job.label : undefined });
 
-      const outcome = await this.monitor(page, job, chatId, baseUsers, baseDomUsers);
+      const outcome = await this.monitor(page, job, chatId, baseUsers, baselineDom);
 
       job.status = "downloading";
       const dir = this.resolveOutDir(job.outputDir);
@@ -388,74 +394,103 @@ export class JobManager {
     }
   }
 
+  /**
+   * Waits for the turn to finish while asking ChatGPT for as little as possible:
+   *  - every second: read the page's own DOM + passive activity (free — zero requests)
+   *  - a conversation-JSON check only when something changed, plus a rare backstop, all through
+   *    the shared rate limiter (see apiGet) so many parallel chats never trip ChatGPT's 429s
+   *  - if the data endpoint is unavailable/cooling down, finish from the images the page displays
+   */
   private async monitor(
     page: Page,
     job: Job,
     chatId: string,
     baseUsers: number,
-    baseDomUsers: number,
+    baselineDom: Set<string>,
   ): Promise<{ mode: "api" | "dom"; st: TurnState | null; domImages: string[]; timedOut: boolean; title?: string }> {
     const deadline = (job.startedAt ?? Date.now()) + (job.timeoutSec ?? config.timeoutSec) * 1000;
-    let apiFails = 0;
-    let lastSig = "";
-    let sigSince = Date.now();
-    let quietSince = 0;
+    const t0 = Date.now();
     let st: TurnState | null = null;
-    let domImages: string[] = [];
     let title: string | undefined;
+    let lastFetch = 0;
+    let fetchSoon = t0 + FIRST_CHECK_MS;
+    let lastAct = activity(page);
+    let wasGenerating = true;
+    let apiSig = "";
+    let apiSigSince = 0;
+    let domSig = "";
+    let domSigSince = t0;
+    let domImages: string[] = [];
+    let quietSince = 0;
 
     while (Date.now() < deadline) {
       if (page.isClosed()) throw new Error("The ChatGPT tab was closed while generating.");
+      const now = Date.now();
       const signals = await pageSignals(page).catch(() => null);
-      const r = await fetchConversation(page, chatId).catch(() => null);
-      if (r?.status === 429) {
-        debug(`${job.id}: rate limited by ChatGPT, backing off`);
-        await sleep(10_000);
-        continue;
-      }
-      if (r?.ok && r.json?.mapping) {
-        st = analyzeTurn(r.json, baseUsers);
-        title = r.json.title ?? title;
-        apiFails = 0;
-      } else {
-        apiFails++;
-        debug(`${job.id}: conversation API ${r?.status ?? "error"} (${apiFails})`);
-      }
-      const useDom = apiFails >= 3;
-      domImages = signals && signals.userMessages > baseDomUsers ? signals.domImages : [];
-      const imgs = useDom ? domImages : (st?.images.map((i) => i.pointer) ?? []);
-      const sig = imgs.join("|");
-      if (sig !== lastSig) {
-        lastSig = sig;
-        sigSince = Date.now();
-      }
       const generating = signals?.generating ?? false;
       const pendingText = signals?.imagePendingText ?? false;
 
-      if (imgs.length) {
-        // Fast path: ChatGPT marked the turn complete. Otherwise require the image set to sit still for STABLE_MS.
-        const turnComplete = !useDom && st?.endTurn;
-        if (!generating && (turnComplete || Date.now() - sigSince >= STABLE_MS)) {
-          return { mode: useDom ? "dom" : "api", st, domImages, timedOut: false, title };
+      domImages = (signals?.domImages ?? []).filter((src) => !baselineDom.has(src));
+      const dsig = domImages.join("|");
+      if (dsig !== domSig) {
+        domSig = dsig;
+        domSigSince = now;
+        if (domImages.length) fetchSoon = Math.min(fetchSoon, now + 1500);
+      }
+      const act = activity(page);
+      if (act !== lastAct) {
+        lastAct = act;
+        fetchSoon = Math.min(fetchSoon, now + 2000);
+      }
+      if (wasGenerating && !generating) fetchSoon = Math.min(fetchSoon, now + 1500);
+      wasGenerating = generating;
+
+      // Conversation JSON: on a trigger or the backstop, never more than once per MIN_FETCH_GAP_MS per job.
+      const due = now >= Math.min(fetchSoon, lastFetch + BACKSTOP_MS) && now - t0 >= 3000;
+      if (due && now - lastFetch >= MIN_FETCH_GAP_MS && !apiCoolingDown()) {
+        lastFetch = now;
+        fetchSoon = Infinity;
+        const r = await fetchConversation(page, chatId).catch(() => null);
+        if (r?.ok && r.json?.mapping) {
+          st = analyzeTurn(r.json, baseUsers);
+          title = r.json.title ?? title;
+          const sig = st.images.map((i) => i.pointer).join("|");
+          if (sig !== apiSig) {
+            apiSig = sig;
+            apiSigSince = Date.now();
+          }
+          if (st.images.length && !st.endTurn) fetchSoon = Date.now() + STABLE_MS + 500;
+        } else {
+          debug(`${job.id}: conversation check ${r?.status ?? "error"}`);
         }
-        quietSince = 0;
-      } else {
-        const apiSaysDone = !useDom && st?.registered && !st.asyncPending && st.endTurn;
-        const domSaysDone = useDom && signals && signals.userMessages > baseDomUsers;
-        if ((apiSaysDone || domSaysDone) && !generating && !pendingText) {
+      }
+
+      // Done (API): images present and ChatGPT marked the turn complete, or the set stayed put across checks.
+      if (st?.images.length && !generating && (st.endTurn || (lastFetch > apiSigSince && Date.now() - apiSigSince >= STABLE_MS))) {
+        return { mode: "api", st, domImages, timedOut: false, title };
+      }
+
+      // Done (page): new finished image(s) on screen and stable — no data endpoint needed.
+      if (!st?.images.length && domImages.length && !generating && !pendingText && Date.now() - domSigSince >= DOM_STABLE_MS) {
+        return { mode: "dom", st, domImages, timedOut: false, title };
+      }
+
+      // Text-only answer (refusal, limit reached, a question): ChatGPT says done, nothing pending, confirmed after a grace period.
+      if (!st?.images.length && !domImages.length) {
+        const apiSaysDone = st?.registered && !st.asyncPending && st.endTurn;
+        if (apiSaysDone && !generating && !pendingText) {
           quietSince ||= Date.now();
           if (Date.now() - quietSince >= TEXT_ONLY_GRACE_MS) {
-            return { mode: useDom ? "dom" : "api", st, domImages, timedOut: false, title };
+            if (lastFetch >= quietSince + TEXT_ONLY_GRACE_MS - 1000) return { mode: "api", st, domImages, timedOut: false, title };
+            fetchSoon = 0;
           }
         } else {
           quietSince = 0;
         }
       }
-      // 1 s polls; slower when many chats run at once (~4 req/s total at 20 parallel chats).
-      const active = config.maxConcurrency - this.sem.available;
-      await sleep(Math.max(POLL_MS, active * 250));
+      await sleep(POLL_MS);
     }
-    return { mode: apiFails >= 3 ? "dom" : "api", st, domImages, timedOut: true, title };
+    return { mode: st?.images.length ? "api" : "dom", st, domImages, timedOut: true, title };
   }
 
   /** Serialises the "type + click send" step with a small gap, so a burst of 20 jobs looks human-paced. */

@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { config, log, debug } from "./config.js";
 import { seedFromEnv } from "./session.js";
+import { watchActivity } from "./chatgpt.js";
 import { preinstalledChromium, systemBrowsers } from "./chrome-path.js";
 import { ensureVirtualDisplay, stopVirtualDisplay } from "./display.js";
 
@@ -150,6 +151,7 @@ export class BrowserManager {
     const cookies = await main.cookies();
     if (cookies.length) await wctx.addCookies(cookies);
     const page = await wctx.newPage();
+    watchActivity(page); // attach before the page opens its websocket
     this.ownedPages.add(page);
     page.on("close", () => {
       this.ownedPages.delete(page);

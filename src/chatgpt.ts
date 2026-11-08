@@ -12,7 +12,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { Page } from "playwright";
-import { config, debug } from "./config.js";
+import { config, debug, log } from "./config.js";
 import { SEL, css, IMAGE_PENDING_TEXT } from "./selectors.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -51,9 +51,38 @@ export function newChatUrl(model?: string): string {
   return m ? `${config.baseUrl}/?model=${encodeURIComponent(m)}` : `${config.baseUrl}/`;
 }
 
+let loadsInFlight = 0;
+const loadWaiters: Array<() => void> = [];
+
+/** Opens a ChatGPT URL, with at most config.maxPageLoads loading at once (each load is ~25 requests). */
 export async function openUrl(page: Page, url: string): Promise<void> {
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
-  await ensureReady(page);
+  if (loadsInFlight >= config.maxPageLoads) await new Promise<void>((r) => loadWaiters.push(r));
+  loadsInFlight++;
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await ensureReady(page);
+  } finally {
+    loadsInFlight--;
+    loadWaiters.shift()?.();
+  }
+}
+
+/**
+ * Passive activity counter for a page: bumps when the page itself loads an image file or gets a
+ * push over its websocket. Watching this costs ChatGPT zero extra requests.
+ */
+export function watchActivity(page: Page): void {
+  const p = page as Page & { __gimActivity?: number };
+  if (p.__gimActivity !== undefined) return;
+  p.__gimActivity = 0;
+  page.on("response", (r) => {
+    if (/estuary\/content|\/files\/|oaiusercontent|\/conversations?\//.test(r.url())) p.__gimActivity!++;
+  });
+  page.on("websocket", (ws) => ws.on("framereceived", () => p.__gimActivity!++));
+}
+
+export function activity(page: Page): number {
+  return (page as Page & { __gimActivity?: number }).__gimActivity ?? 0;
 }
 
 /** Waits out Cloudflare, verifies login, waits for the composer. */
@@ -103,7 +132,48 @@ export interface ApiResult {
   text?: string;
 }
 
+// One shared, gentle budget for ALL backend requests from this process. ChatGPT rate-limits the
+// whole account (429) when polled hard — and then even its own UI can't load chats.
+let apiNextSlot = 0;
+let apiCooldownUntil = 0;
+let apiStrikes = 0; // consecutive 429s
+let apiGap = config.apiGapMs; // adapts: doubles on 429, eases back toward config.apiGapMs on success
+
+async function apiSlot(): Promise<void> {
+  for (;;) {
+    const now = Date.now();
+    const at = Math.max(apiNextSlot, apiCooldownUntil);
+    if (at <= now) {
+      apiNextSlot = now + apiGap;
+      return;
+    }
+    await sleep(at - now);
+  }
+}
+
+/** True while ChatGPT has told us to back off. */
+export function apiCoolingDown(): boolean {
+  return Date.now() < apiCooldownUntil;
+}
+
 export async function apiGet(page: Page, apiPath: string): Promise<ApiResult> {
+  await apiSlot();
+  const res = await rawApiGet(page, apiPath);
+  if (res.status === 429) {
+    apiStrikes++;
+    apiGap = Math.min(apiGap * 2, 4000);
+    const hinted = Number(res.retryAfter) * 1000;
+    const wait = Number.isFinite(hinted) && hinted > 0 ? hinted : Math.min(10_000 * 2 ** (apiStrikes - 1), 120_000);
+    apiCooldownUntil = Date.now() + wait;
+    log(`ChatGPT asked us to slow down (429) — pausing ${Math.round(wait / 1000)}s, then ${apiGap}ms between requests`);
+  } else if (res.status > 0) {
+    apiStrikes = 0;
+    apiGap = Math.max(config.apiGapMs, Math.round(apiGap * 0.9));
+  }
+  return res;
+}
+
+async function rawApiGet(page: Page, apiPath: string): Promise<ApiResult & { retryAfter?: string | null }> {
   return page.evaluate(async (p: string) => {
     const w = window as any;
     async function token(force: boolean): Promise<string | null> {
@@ -135,7 +205,7 @@ export async function apiGet(page: Page, apiPath: string): Promise<ApiResult> {
     } catch {
       /* not json */
     }
-    return { ok: r.ok, status: r.status, json, text: json ? undefined : text.slice(0, 300) };
+    return { ok: r.ok, status: r.status, json, text: json ? undefined : text.slice(0, 300), retryAfter: r.headers.get("retry-after") };
   }, apiPath);
 }
 
@@ -389,7 +459,7 @@ export async function sendPrompt(page: Page, prompt: string, files: string[] = [
   }
 
   // Wait for send to become enabled (it stays disabled while attachments upload). Fail fast otherwise.
-  const deadline = Date.now() + (files.length ? 120_000 : 15_000);
+  const deadline = Date.now() + (files.length ? 120_000 : 2_500);
   let clicked = false;
   while (Date.now() < deadline) {
     const send = await locate(page, SEL.sendButton, { visible: false });
@@ -460,7 +530,8 @@ export async function resolvePointer(page: Page, pointer: string, conversationId
   const candidates = pointer.startsWith("sediment://") ? [a, b] : [b, a];
   let last = "";
   for (const u of candidates) {
-    const r = await apiGet(page, u);
+    let r = await apiGet(page, u);
+    for (let i = 0; i < 3 && r.status === 429; i++) r = await apiGet(page, u); // apiGet waits out the cooldown
     if (r.ok && r.json?.download_url) return r.json.download_url as string;
     last = `${r.status} ${r.text ?? JSON.stringify(r.json)?.slice(0, 200)}`;
   }
@@ -480,6 +551,7 @@ export async function downloadUrl(page: Page, url: string): Promise<Buffer> {
       debug("node fetch error", err);
     }
   }
+  if (sameOrigin) await apiSlot();
   const b64 = await page.evaluate(
     async ({ u, same }) => {
       const r = await fetch(u, { credentials: same ? "include" : "omit" });

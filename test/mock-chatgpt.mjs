@@ -6,7 +6,16 @@ import zlib from "node:zlib";
 import { randomUUID, randomBytes, createHash } from "node:crypto";
 
 const conversations = new Map(); // id -> { mapping, current_node, title, generating }
-const stats = { sends: 0, maxConcurrent: 0, concurrent: 0, uploads: 0, unauthorized: 0 };
+const stats = { sends: 0, maxConcurrent: 0, concurrent: 0, uploads: 0, unauthorized: 0, apiRequests: 0, rateLimited: 0 };
+// Like ChatGPT: the account gets 429s when its data endpoints are hammered (default 2.5 req/s over 10 s).
+const RATE_LIMIT = Number(process.env.MOCK_RATE_LIMIT ?? 25);
+let windowStart = Date.now(), windowCount = 0;
+function rateLimited() {
+  const now = Date.now();
+  if (now - windowStart > 10_000) { windowStart = now; windowCount = 0; }
+  windowCount++;
+  return windowCount > RATE_LIMIT;
+}
 
 function crc32(buf) {
   let c, crc = 0xffffffff;
@@ -121,7 +130,7 @@ async function token() { return (await (await fetch('/api/auth/session')).json()
 function cid() { const m = location.pathname.match(/\\/c\\/([0-9a-f]{8}-[0-9a-f-]{27})/); return m && m[1]; }
 async function render() {
   const id = cid(); if (!id) return;
-  const r = await fetch('/backend-api/conversation/' + id, { headers: { authorization: 'Bearer ' + await token() } });
+  const r = await fetch('/backend-api/conversation/' + id, { headers: { authorization: 'Bearer ' + await token(), 'x-mock-ui': '1' } });
   if (!r.ok) return;
   const c = await r.json();
   const th = document.getElementById('thread'); th.innerHTML = '';
@@ -153,7 +162,7 @@ btn.addEventListener('click', async (e) => {
   if (isNew) setTimeout(() => history.replaceState({}, '', '/c/' + conversation_id), 700);
   setTimeout(() => { btn.removeAttribute('data-stop-generating'); btn.setAttribute('aria-label', 'Send message'); sync(); }, 1500);
 });
-setInterval(render, 1000); render();
+setInterval(render, 3000); render();
 </script></body></html>`;
 
 function cookies(req) {
@@ -166,6 +175,14 @@ export function startMock(port = 0) {
     const loggedIn = cookies(req)["__Secure-next-auth.session-token"] === "mock-session";
     const json = (code, body) => res.writeHead(code, { "content-type": "application/json" }).end(JSON.stringify(body));
     const body = async () => { const c = []; for await (const x of req) c.push(x); return Buffer.concat(c).toString(); };
+    const limited = () => {
+      if (req.headers["x-mock-ui"]) return false; // the app's own rendering (real ChatGPT gets websocket pushes)
+      stats.apiRequests++;
+      if (!rateLimited()) return false;
+      stats.rateLimited++;
+      res.writeHead(429, { "content-type": "application/json", "retry-after": "5" }).end(JSON.stringify({ detail: "Too many requests" }));
+      return true;
+    };
     const authed = () => {
       if (req.headers.authorization === "Bearer mock-token" && loggedIn) return true;
       stats.unauthorized++;
@@ -188,19 +205,19 @@ export function startMock(port = 0) {
     }
     let m;
     if ((m = url.pathname.match(/^\/backend-api\/conversation\/([\w-]+)$/))) {
-      if (!authed()) return;
+      if (limited() || !authed()) return;
       const c = conversations.get(m[1]);
       return c ? json(200, { title: c.title, current_node: c.current_node, mapping: c.mapping, generating: !!c.generating }) : json(404, { detail: "not found" });
     }
     if ((m = url.pathname.match(/^\/backend-api\/files\/download\/([\w-]+)$/))) {
-      if (!authed()) return;
+      if (limited() || !authed()) return;
       if (!conversations.has(url.searchParams.get("conversation_id"))) return json(400, { detail: "Invalid conversation" });
       // Like the real CDN: a different origin than the app (exercises the cross-origin download path).
       const cdn = `http://${String(req.headers.host).replace("127.0.0.1", "localhost")}`;
       return json(200, { status: "success", download_url: `${cdn}/mock/blob/${m[1]}?sig=abc` });
     }
-    if ((m = url.pathname.match(/^\/mock\/blob\/([\w-]+)$/))) return res.writeHead(200, { "content-type": "image/png" }).end(png(96, 64, colorFor(m[1])));
-    if (url.pathname === "/backend-api/estuary/content") return res.writeHead(200, { "content-type": "image/png" }).end(png(512, 340, colorFor(url.searchParams.get("id") ?? "x")));
+    if ((m = url.pathname.match(/^\/mock\/blob\/([\w-]+)$/))) return res.writeHead(200, { "content-type": "image/png" }).end(png(600, 400, colorFor(m[1])));
+    if (url.pathname === "/backend-api/estuary/content") return res.writeHead(200, { "content-type": "image/png" }).end(png(600, 400, colorFor(url.searchParams.get("id") ?? "x")));
     res.writeHead(404).end();
   });
   return new Promise((resolve) => server.listen(port, "127.0.0.1", () => resolve({ server, port: server.address().port, stats })));

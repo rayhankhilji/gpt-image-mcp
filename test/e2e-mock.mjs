@@ -120,15 +120,16 @@ try {
       assert.ok(j.chat_id && j.chat_url.includes("/c/"));
       for (const img of j.images) {
         assert.ok(fs.existsSync(img.path), img.path);
-        assert.equal(img.width, 96);
-        assert.equal(img.height, 64);
+        assert.equal(img.width, 600);
+        assert.equal(img.height, 400);
       }
     }
     assert.equal(new Set(gen.jobs.map((j) => j.chat_id)).size, 12, "each job gets its own chat");
     assert.ok(stats.maxConcurrent >= 8, `expected parallel generation, max concurrent was ${stats.maxConcurrent}`);
     assert.equal(stats.uploads, 1);
     assert.ok(secs < 60, `12 jobs took ${secs}s — not parallel?`);
-    console.log(`   12 jobs in ${secs.toFixed(1)}s, peak concurrent generations: ${stats.maxConcurrent}`);
+    console.log(`   12 jobs in ${secs.toFixed(1)}s, peak concurrent generations: ${stats.maxConcurrent}, data requests: ${stats.apiRequests}, 429s: ${stats.rateLimited}`);
+    assert.ok(stats.rateLimited <= 2, `adaptive limiter should settle within a couple of 429s (got ${stats.rateLimited})`);
   });
 
   let pending;
