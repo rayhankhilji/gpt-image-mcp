@@ -118,7 +118,6 @@ export class BrowserManager {
       this.browser = null;
       this.ownedPages.clear();
     });
-    this.ctx = ctx;
 
     if (!config.cdpUrl) {
       try {
@@ -130,6 +129,8 @@ export class BrowserManager {
         log(`could not load GPT_IMAGE_SESSION: ${(err as Error).message}`);
       }
     }
+    // Only now is the context handed out: callers of context() wait for the login to be in place.
+    this.ctx = ctx;
 
     if (!config.cdpUrl && !this.headless && !this.opts.forceHeaded && config.window === "minimized") {
       const p = ctx.pages()[0] ?? (await ctx.newPage());
