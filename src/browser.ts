@@ -146,6 +146,12 @@ export class BrowserManager {
   private async firstVisit(ctx: BrowserContext): Promise<void> {
     if (!config.firstVisit) return;
     const page = ctx.pages()[0] ?? (await ctx.newPage());
+    await this.visitSignedOut(ctx, page);
+    await page.goto("about:blank").catch(() => {}); // leave the tab blank so newPage() can reuse it
+  }
+
+  /** Loads ChatGPT's home page in a context that carries no login yet, and waits for Cloudflare's own cookies. */
+  private async visitSignedOut(ctx: BrowserContext, page: Page): Promise<void> {
     try {
       await page.goto(config.baseUrl + "/", { waitUntil: "domcontentloaded", timeout: 60_000 });
       const deadline = Date.now() + 15_000;
@@ -158,8 +164,6 @@ export class BrowserManager {
       debug("first visit done", page.url());
     } catch (err) {
       debug(`first visit failed: ${(err as Error).message.split("\n")[0]}`);
-    } finally {
-      await page.goto("about:blank").catch(() => {}); // leave the tab blank so newPage() can reuse it
     }
   }
 
@@ -176,11 +180,6 @@ export class BrowserManager {
       viewport: this.headless ? { width: 1280, height: 900 } : null,
       acceptDownloads: true,
     });
-    // Copy the login, not Cloudflare's cookies. A cf_clearance earned by the profile (any signed-in page
-    // load there, e.g. a status check) and replayed from a different context gets that context the
-    // "verify you are human" page on every job. Each context earns its own on its first load.
-    const cookies = (await main.cookies()).filter((c) => !isCloudflareCookie(c.name));
-    if (cookies.length) await wctx.addCookies(cookies);
     const page = await wctx.newPage();
     watchActivity(page); // attach before the page opens its websocket
     this.ownedPages.add(page);
@@ -198,6 +197,13 @@ export class BrowserManager {
       await minimizeWindow(page).catch((e) => debug("minimize failed", e));
     }
     page.setDefaultTimeout(30_000);
+    // Each job context meets ChatGPT signed out first and only then receives the login, the same order
+    // as a fresh profile. A context that makes its very first request already carrying a login from
+    // elsewhere is the one that gets the "verify you are human" page. Cloudflare's own cookies are never
+    // copied: a cf_clearance replayed from a different context brings the check on every job.
+    if (config.firstVisit && !config.cdpUrl) await this.visitSignedOut(wctx, page);
+    const cookies = (await main.cookies()).filter((c) => !isCloudflareCookie(c.name));
+    if (cookies.length) await wctx.addCookies(cookies);
     return page;
   }
 

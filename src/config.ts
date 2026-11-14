@@ -43,7 +43,7 @@ export const config = {
   window: ((env.GPT_IMAGE_WINDOW || "minimized").toLowerCase() as WindowMode),
   /** Open ChatGPT once, signed out, before the login from GPT_IMAGE_SESSION is added to a fresh profile. */
   firstVisit: bool(env.GPT_IMAGE_FIRST_VISIT, true),
-  firstVisitSettleMs: Math.max(0, int(env.GPT_IMAGE_FIRST_VISIT_SETTLE_MS, 4000)),
+  firstVisitSettleMs: Math.max(0, int(env.GPT_IMAGE_FIRST_VISIT_SETTLE_MS, 2500)),
   /** Pretend every tab is visible/focused so background tabs aren't throttled by the page. */
   forceVisible: bool(env.GPT_IMAGE_FORCE_VISIBLE, true),
 
