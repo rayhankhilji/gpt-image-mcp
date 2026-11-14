@@ -1,8 +1,8 @@
 import fs from "node:fs";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { config, log, debug } from "./config.js";
-import { seedFromEnv } from "./session.js";
-import { getSession, watchActivity } from "./chatgpt.js";
+import { isCloudflareCookie, seedFromEnv } from "./session.js";
+import { watchActivity } from "./chatgpt.js";
 import { preinstalledChromium, systemBrowsers } from "./chrome-path.js";
 import { ensureVirtualDisplay, stopVirtualDisplay } from "./display.js";
 
@@ -121,10 +121,7 @@ export class BrowserManager {
 
     if (!config.cdpUrl) {
       try {
-        if (await seedFromEnv(ctx, () => this.firstVisit(ctx))) {
-          await this.confirmLogin(ctx);
-          log("loaded ChatGPT login from GPT_IMAGE_SESSION");
-        }
+        if (await seedFromEnv(ctx, () => this.firstVisit(ctx))) log("loaded ChatGPT login from GPT_IMAGE_SESSION");
       } catch (err) {
         log(`could not load GPT_IMAGE_SESSION: ${(err as Error).message}`);
       }
@@ -167,29 +164,6 @@ export class BrowserManager {
   }
 
   /**
-   * After the login is added, load ChatGPT once in the profile and wait until it answers as signed in.
-   * Jobs run in separate contexts that copy the profile's cookies; without this the first job can
-   * start in the moment before the new login has taken and fail with "not logged in".
-   */
-  private async confirmLogin(ctx: BrowserContext): Promise<void> {
-    if (!config.firstVisit) return;
-    const page = ctx.pages()[0] ?? (await ctx.newPage());
-    try {
-      await page.goto(config.baseUrl + "/", { waitUntil: "domcontentloaded", timeout: 60_000 });
-      const deadline = Date.now() + 20_000;
-      while (Date.now() < deadline) {
-        if ((await getSession(page)).loggedIn) break;
-        await page.waitForTimeout(1000);
-      }
-      await page.waitForTimeout(1500);
-    } catch (err) {
-      debug(`login confirmation failed: ${(err as Error).message.split("\n")[0]}`);
-    } finally {
-      await page.goto("about:blank").catch(() => {});
-    }
-  }
-
-  /**
    * A page in its OWN browser context (like a separate incognito window) carrying the login cookies.
    * ChatGPT's web app shares a single "new chat in progress" slot across tabs of one profile, so
    * parallel new chats in ordinary tabs collide (placeholder /c/local-chatgpt, locked send button).
@@ -202,7 +176,10 @@ export class BrowserManager {
       viewport: this.headless ? { width: 1280, height: 900 } : null,
       acceptDownloads: true,
     });
-    const cookies = await main.cookies();
+    // Copy the login, not Cloudflare's cookies. A cf_clearance earned by the profile (any signed-in page
+    // load there, e.g. a status check) and replayed from a different context gets that context the
+    // "verify you are human" page on every job. Each context earns its own on its first load.
+    const cookies = (await main.cookies()).filter((c) => !isCloudflareCookie(c.name));
     if (cookies.length) await wctx.addCookies(cookies);
     const page = await wctx.newPage();
     watchActivity(page); // attach before the page opens its websocket

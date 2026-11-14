@@ -22,6 +22,8 @@ interface PwCookie {
 
 // Cloudflare cookies are bound to the original IP/UA — the new machine must earn its own.
 const SKIP = /^(cf_clearance|__cf_bm|_cfuvid)$/;
+/** Cloudflare's own cookies. Never copied between machines or between browser contexts: each earns its own. */
+export const isCloudflareCookie = (name: string): boolean => SKIP.test(name);
 const appHost = () => new URL(config.baseUrl).hostname;
 const DOMAINS = { test: (host: string) => /(^|\.)(chatgpt\.com|openai\.com)$/.test(host) || host === appHost() };
 
