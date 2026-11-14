@@ -104,6 +104,17 @@ export async function ensureReady(page: Page): Promise<void> {
   try {
     await composer.waitFor({ state: "visible", timeout: 60_000 });
   } catch (err) {
+    // The check can also be embedded in ChatGPT's own page, where the title does not change.
+    const challenged =
+      (await page.locator('iframe[src*="challenges.cloudflare.com"]').count().catch(() => 0)) > 0 ||
+      /verify you are human/i.test(await page.locator("body").innerText({ timeout: 2000 }).catch(() => ""));
+    if (challenged) {
+      throw new Error(
+        "ChatGPT is showing a Cloudflare 'verify you are human' check to this browser. Do not retry in a loop. " +
+          "Start from a fresh profile (GPT_IMAGE_PROFILE_DIR) so the browser visits ChatGPT before the login is added, " +
+          "or run on a home network (datacenter IPs are checked more often).",
+      );
+    }
     throw new Error(`ChatGPT composer never appeared (${(err as Error).message.split("\n")[0]}). Selectors in src/selectors.ts may need updating.`);
   }
   await dismissOverlays(page);

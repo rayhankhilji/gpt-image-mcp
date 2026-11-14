@@ -122,7 +122,7 @@ export class BrowserManager {
 
     if (!config.cdpUrl) {
       try {
-        if (await seedFromEnv(ctx)) log("loaded ChatGPT login from GPT_IMAGE_SESSION");
+        if (await seedFromEnv(ctx, () => this.firstVisit(ctx))) log("loaded ChatGPT login from GPT_IMAGE_SESSION");
       } catch (err) {
         log(`could not load GPT_IMAGE_SESSION: ${(err as Error).message}`);
       }
@@ -133,6 +133,33 @@ export class BrowserManager {
       await minimizeWindow(p).catch((e) => debug("minimize failed", e));
     }
     return ctx;
+  }
+
+  /**
+   * A brand-new profile opens ChatGPT once as an ordinary signed-out visitor BEFORE the login from
+   * GPT_IMAGE_SESSION is added. The browser then holds Cloudflare cookies it earned itself on this
+   * machine. A fresh profile that arrives already carrying a login from another machine is far more
+   * likely to be shown the "verify you are human" page, which nothing here can or should answer.
+   * Disable with GPT_IMAGE_FIRST_VISIT=0.
+   */
+  private async firstVisit(ctx: BrowserContext): Promise<void> {
+    if (!config.firstVisit) return;
+    const page = ctx.pages()[0] ?? (await ctx.newPage());
+    try {
+      await page.goto(config.baseUrl + "/", { waitUntil: "domcontentloaded", timeout: 60_000 });
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline) {
+        const names = (await ctx.cookies(config.baseUrl)).map((c) => c.name);
+        if (names.includes("__cf_bm") || names.includes("cf_clearance")) break;
+        await page.waitForTimeout(500);
+      }
+      await page.waitForTimeout(config.firstVisitSettleMs);
+      debug("first visit done", page.url());
+    } catch (err) {
+      debug(`first visit failed: ${(err as Error).message.split("\n")[0]}`);
+    } finally {
+      await page.goto("about:blank").catch(() => {}); // leave the tab blank so newPage() can reuse it
+    }
   }
 
   /**

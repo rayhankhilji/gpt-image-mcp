@@ -193,8 +193,13 @@ Then connect any agent to `http://server:8787/mcp` with `Authorization: Bearer s
 behind HTTPS (Caddy, Cloudflare Tunnel, Tailscale…) if it's reachable from the internet. In remote mode,
 every image result also has a `url` the agent can download from.
 
-Datacenter IPs get more Cloudflare checks than home connections. If the server gets stuck on "verify you are
-human", run it on a home or residential network.
+A fresh profile visits ChatGPT once as a signed-out visitor before the login from `GPT_IMAGE_SESSION` is
+added. A browser that arrives on a new machine already carrying a login gets the "verify you are human"
+check far more often. If a profile is already being checked, start again from an empty one
+(`GPT_IMAGE_PROFILE_DIR`, or a new container).
+
+Datacenter IPs still get more Cloudflare checks than home connections. If the server stays stuck on "verify
+you are human" from a fresh profile, run it on a home or residential network.
 
 ### Other login options
 
@@ -251,6 +256,7 @@ To refine an image: gpt-image-mcp edit <chat_id> "<change>" --out ./images
 | `GPT_IMAGE_EXECUTABLE_PATH` | | explicit browser binary |
 | `GPT_IMAGE_MODEL` | account default | `?model=` slug for new chats |
 | `GPT_IMAGE_SESSION` / `GPT_IMAGE_SESSION_FILE` | | login to seed an empty profile (see Option A) |
+| `GPT_IMAGE_FIRST_VISIT` | `1` | a fresh profile opens ChatGPT once signed out before the login from `GPT_IMAGE_SESSION` is added, so it holds Cloudflare cookies it earned on this machine. `0` turns it off |
 | `GPT_IMAGE_CDP_URL` | | attach to an existing Chrome |
 | `GPT_IMAGE_HTTP_TOKEN` / `_HOST` / `_PORT` / `GPT_IMAGE_PUBLIC_URL` | | remote server settings |
 | `GPT_IMAGE_SERVER_URL` | | make the CLI use a remote server |

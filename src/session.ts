@@ -118,12 +118,16 @@ export function sessionFromEnv(): string | null {
   return v;
 }
 
-/** Seeds an empty profile from the env secret — lets fresh cloud containers start already logged in. */
-export async function seedFromEnv(ctx: BrowserContext): Promise<boolean> {
+/**
+ * Seeds an empty profile from the env secret — lets fresh cloud containers start already logged in.
+ * `beforeImport` runs only when a login is about to be added (see BrowserManager.firstVisit).
+ */
+export async function seedFromEnv(ctx: BrowserContext, beforeImport?: () => Promise<void>): Promise<boolean> {
   const raw = sessionFromEnv();
   if (!raw) return false;
   const have = (await ctx.cookies(config.baseUrl)).some((c) => c.name.startsWith("__Secure-next-auth.session-token"));
   if (have) return false; // the profile's own (fresher, auto-refreshed) login wins
+  if (beforeImport) await beforeImport();
   await importSession(ctx, raw);
   return true;
 }
